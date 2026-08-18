@@ -1,5 +1,13 @@
 from dataclasses import dataclass
 
+from app.rag.retriever import retrieve_policy
+
+# Below this retrieval confidence the evidence is treated as too weak to rely on
+# and the request should be flagged for human review rather than acted on.
+UNCERTAINTY_THRESHOLD = 0.75
+
+CONFLICT_TERMS = ("bypass", "fake", "forged", "without permission", "without approval")
+
 @dataclass(frozen=True)
 class PolicyResult:
     found: bool
@@ -9,17 +17,19 @@ class PolicyResult:
     confidence: float
     conflict: bool
     reason: str
-
-POLICIES = {
- "MAINTENANCE": ("FAC-MNT-001", "Facilities Maintenance Policy", "1.4"),
- "LAB_BOOKING": ("LIB-BOOK-002", "Library Seat Booking Policy", "2.1"),
- "CERTIFICATE": ("ACA-CERT-003", "Academic Certificate Policy", "3.0"),
-}
+    source_section: str = ""
+    citation: str = ""
+    uncertain: bool = False
 
 def validate(intent: str, text: str) -> PolicyResult:
-    if any(x in text.lower() for x in ("bypass", "fake", "forged", "without permission", "without approval")):
-        return PolicyResult(True, "INST-CONDUCT-001", "Institutional Conduct Policy", "3.2", .98, True, "Request conflicts with institutional policy.")
-    policy = POLICIES.get(intent)
-    if not policy:
+    if any(x in text.lower() for x in CONFLICT_TERMS):
+        return PolicyResult(True, "INST-CONDUCT-001", "Institutional Conduct Policy", "3.2", .98, True, "Request conflicts with institutional policy.", source_section="Prohibited Conduct", citation="Requests to forge, fake, or bypass approvals are strictly prohibited and will be stopped.")
+    match = retrieve_policy(intent, text)
+    if not match:
         return PolicyResult(False, "", "No verified policy", "", 0, False, "No sufficient official policy evidence was found.")
-    return PolicyResult(True, policy[0], policy[1], policy[2], .94, False, "Verified policy evidence is applicable.")
+    uncertain = match.confidence < UNCERTAINTY_THRESHOLD
+    reason = (
+        "Retrieved policy evidence is weak; human review is recommended."
+        if uncertain else "Verified policy evidence is applicable."
+    )
+    return PolicyResult(True, match.policy_id, match.name, match.version, match.confidence, False, reason, source_section=match.section, citation=match.snippet, uncertain=uncertain)

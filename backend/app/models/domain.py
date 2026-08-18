@@ -14,12 +14,14 @@ class Decision(StrEnum):
     ACT = "ACT"
     ASK = "ASK"
     APPROVE = "APPROVE"
+    ESCALATE = "ESCALATE"
     STOP = "STOP"
 
 class RequestStatus(StrEnum):
     EXECUTED = "EXECUTED"
     AWAITING_CONFIRMATION = "AWAITING_CONFIRMATION"
     PENDING_APPROVAL = "PENDING_APPROVAL"
+    ESCALATED = "ESCALATED"
     STOPPED = "STOPPED"
 
 @dataclass
