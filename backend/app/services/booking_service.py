@@ -8,8 +8,14 @@ OPEN_HOUR, CLOSE_HOUR = 8, 22
 BOOKINGS: dict[tuple[str, str, str, str], str] = {}
 
 def allocate(date: str, time: str, preferred_lab: str, preferred_seat: str, user_id: str) -> tuple[str, str]:
-    # Try the requested lab/seat first, then gracefully fall back to any free
-    # seat in the requested lab, then any other lab, like a real booking agent.
+    # Explicit choices are promises: never silently replace a requested room or
+    # seat. Unspecified values may be assigned after the user confirms.
+    if preferred_lab in LABS and preferred_seat in SEATS:
+        key = (date, time, preferred_lab, preferred_seat)
+        if key in BOOKINGS:
+            raise ValueError("The selected room and seat are no longer available. Please choose an alternative.")
+        BOOKINGS[key] = user_id
+        return preferred_lab, preferred_seat
     lab_order = ([preferred_lab] if preferred_lab in LABS else []) + [lab for lab in LABS if lab != preferred_lab]
     seat_order = ([preferred_seat] if preferred_seat in SEATS else []) + [seat for seat in SEATS if seat != preferred_seat]
     for lab in lab_order:
@@ -25,6 +31,19 @@ def is_taken(date: str, time: str, lab: str, seat: str) -> bool:
 
 def available_labs(date: str, time: str) -> list[str]:
     return [lab for lab in LABS if any((date, time, lab, seat) not in BOOKINGS for seat in SEATS)]
+
+def alternatives(date: str, time: str, preferred_lab: str = "", preferred_seat: str = "", limit: int = 3) -> list[dict]:
+    """Return transparent alternatives without reserving or silently choosing one."""
+    result = []
+    lab_order = ([preferred_lab] if preferred_lab in LABS else []) + [lab for lab in LABS if lab != preferred_lab]
+    seat_order = ([preferred_seat] if preferred_seat in SEATS else []) + [seat for seat in SEATS if seat != preferred_seat]
+    for lab in lab_order:
+        for seat in seat_order:
+            if not is_taken(date, time, lab, seat):
+                result.append({"space": lab, "seat": seat, "date": date, "time": time})
+                if len(result) == limit:
+                    return result
+    return result
 
 def suggest_slot(preferred_date: str = "") -> tuple[str, str]:
     """Pick the next open one-hour slot within library hours (Mon-Sat, 08:00-22:00).

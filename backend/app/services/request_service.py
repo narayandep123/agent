@@ -5,7 +5,7 @@ from app.permissions.rbac import allowed
 from app.policies.guardian import validate
 from app.risk.engine import assess
 from app.services.audit_service import record
-from app.services.booking_service import allocate, available_labs, suggest_slot
+from app.services.booking_service import LABS, SEATS, allocate, alternatives, available_labs, is_taken, suggest_slot
 from app.services.notification_service import notify
 from datetime import date as current_date, datetime
 
@@ -23,7 +23,7 @@ def _notify_created(request):
     to = request.user_id
     rid = request.id
     entities = request.entities
-    if request.intent == "MAINTENANCE" and request.status == RequestStatus.EXECUTED:
+    if request.intent == "MAINTENANCE" and request.status == RequestStatus.OPEN:
         notify(to, f"Maintenance ticket logged · {rid}",
                f"Hi,\n\nYour maintenance request has been logged and sent to the facilities team.\n\n"
                f"Ticket: {rid}\nIssue: {entities.get('issue', 'N/A')}\nLocation: {entities.get('location', 'N/A')}\n"
@@ -83,6 +83,11 @@ def create(text: str, role, proposed_intent: str | None = None, proposed_entitie
             outside_hours = open_hour < 8 or close_hour > 22
         except (ValueError, IndexError):
             outside_hours = False
+    exact_conflict = (
+        intent == "LAB_BOOKING" and not missing_core_booking
+        and entities.get("space") in LABS and entities.get("seat") in SEATS
+        and is_taken(entities["date"], entities["time"], entities["space"], entities["seat"])
+    )
     if sunday_booking:
         decision = Decision.STOP
         reason = "Library booking is unavailable on Sundays. Please choose Monday to Saturday."
@@ -92,6 +97,16 @@ def create(text: str, role, proposed_intent: str | None = None, proposed_entitie
     elif past_time:
         decision = Decision.STOP
         reason = "That time slot has already started or passed according to the system clock. Please choose a future time."
+    elif exact_conflict:
+        decision = Decision.ASK
+        entities["alternatives"] = alternatives(
+            entities["date"], entities["time"], entities["space"], entities["seat"], 3,
+        )
+        choices = "; ".join(f"{item['space']} seat {item['seat']}" for item in entities["alternatives"])
+        reason = (
+            f"{entities['space']} seat {entities['seat']} is already booked for that slot. "
+            f"Available alternatives are: {choices}. Please choose one; I won't select a replacement without your confirmation."
+        )
     elif missing_core_booking:
         decision = Decision.ASK
         missing = [label for key, label in (("date", "day/date"), ("time", "time slot")) if entities.get(key) == "Not specified"]
@@ -116,7 +131,12 @@ def create(text: str, role, proposed_intent: str | None = None, proposed_entitie
     elif missing_floor:
         decision = Decision.ASK
         reason = "I found the location, but need the floor number before I can create the maintenance request."
-    status = RequestStatus.AWAITING_CONFIRMATION if (missing_core_booking or space_unspecified or missing_location or missing_floor) else {"ACT": RequestStatus.EXECUTED, "ASK": RequestStatus.AWAITING_CONFIRMATION, "APPROVE": RequestStatus.PENDING_APPROVAL, "ESCALATE": RequestStatus.ESCALATED, "STOP": RequestStatus.STOPPED}[decision.value]
+    status = RequestStatus.AWAITING_CONFIRMATION if (exact_conflict or missing_core_booking or space_unspecified or missing_location or missing_floor) else {"ACT": RequestStatus.EXECUTED, "ASK": RequestStatus.AWAITING_CONFIRMATION, "APPROVE": RequestStatus.PENDING_APPROVAL, "ESCALATE": RequestStatus.ESCALATED, "STOP": RequestStatus.STOPPED}[decision.value]
+    if intent == "MAINTENANCE" and decision == Decision.ACT:
+        status = RequestStatus.OPEN
+        entities.setdefault("ticket_status", "OPEN")
+        entities.setdefault("assigned_to", "")
+        entities.setdefault("admin_comment", "")
     request = ServiceRequest(role=role, text=text, intent=intent, entities=entities, decision=decision, status=status, policy_id=policy.policy_id, policy_name=f"{policy.name} v{policy.version}", risk=risk, reason=reason)
     request.user_id = user_id
     REQUESTS[request.id] = request
@@ -180,6 +200,38 @@ def review(request_id: str, approved: bool, reviewer: str = "approver", comment:
     notify(request.user_id, f"Update on your request · {request.id}",
            f"Hi,\n\nThere's an update on your request {request.id}.\n\n"
            f"Decision: {'Approved' if approved else 'Declined'}\nStatus: {request.status.value}\n"
+           f"Details: {request.reason}\n\n— CampusFlow AI")
+    return request, audit_id
+
+def update_maintenance(request_id: str, status: str, assigned_to: str, comment: str, reviewer: str):
+    request = REQUESTS.get(request_id)
+    if not request:
+        raise KeyError(request_id)
+    if request.intent != "MAINTENANCE":
+        raise ValueError("This request is not a maintenance ticket.")
+    target = status.upper().strip()
+    if target not in {"OPEN", "ASSIGNED", "RESOLVED"}:
+        raise ValueError("Maintenance status must be OPEN, ASSIGNED, or RESOLVED.")
+    if target == "ASSIGNED" and not assigned_to.strip():
+        raise ValueError("Please provide the person or team assigned to this ticket.")
+    request.status = RequestStatus(target)
+    request.entities["ticket_status"] = target
+    if assigned_to.strip():
+        request.entities["assigned_to"] = assigned_to.strip()
+    if comment.strip():
+        request.entities["admin_comment"] = comment.strip()
+    if target == "ASSIGNED":
+        request.reason = f"Your maintenance ticket has been assigned to {request.entities['assigned_to']}."
+    elif target == "RESOLVED":
+        request.reason = "The facilities team has marked your maintenance ticket as resolved."
+    else:
+        request.reason = "Your maintenance ticket is open and awaiting assignment."
+    if comment.strip():
+        request.reason += f" Update: {comment.strip()}"
+    audit_id = record(request.id, reviewer, "MAINTENANCE_UPDATE", target, request.policy_name, request.risk)
+    notify(request.user_id, f"Maintenance ticket {target.title()} · {request.id}",
+           f"Hi,\n\nYour maintenance ticket has been updated.\n\nReference: {request.id}\n"
+           f"Status: {target}\nAssigned to: {request.entities.get('assigned_to') or 'Not assigned'}\n"
            f"Details: {request.reason}\n\n— CampusFlow AI")
     return request, audit_id
 

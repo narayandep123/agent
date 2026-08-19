@@ -21,6 +21,11 @@ class ReviewInput(BaseModel):
     reviewer: str = "approver"
     comment: str = ""
 
+class MaintenanceUpdateInput(BaseModel):
+    status: str
+    assigned_to: str = ""
+    comment: str = ""
+
 class DecisionResponse(BaseModel):
     request_id: str
     intent: str
@@ -34,3 +39,4 @@ class DecisionResponse(BaseModel):
     message: str
     audit_id: str
     requires_confirmation: bool = False
+    trace: list[dict[str, Any]] = Field(default_factory=list)

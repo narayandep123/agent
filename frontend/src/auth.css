@@ -40,6 +40,8 @@
 /* ---- Notifications ---- */
 .notif-list{display:flex;flex-direction:column;gap:12px;margin-top:14px;}
 .notif{display:flex;gap:12px;background:#0b1220;border:1px solid #1e293b;border-radius:14px;padding:14px 16px;}
+.notif.unread{border-color:#2563eb;background:#0d1a2e;box-shadow:inset 3px 0 #38bdf8;}
+.notif.read{opacity:.88;}
 .notif.queued{opacity:.85;}
 .notif-ico{width:34px;height:34px;flex:0 0 34px;border-radius:10px;display:flex;align-items:center;justify-content:center;background:#122a4d;color:#60a5fa;}
 .notif-body{flex:1;min-width:0;}

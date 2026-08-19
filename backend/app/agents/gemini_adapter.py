@@ -1,80 +1,114 @@
-"""Optional Gemini proposal adapter.
+"""Gemini-backed proposal planner with a fail-closed deterministic fallback.
 
-This adapter maps free-text requests to a *proposed* intent, entities and
-language. It is strictly a proposal node: it never executes tools, never
-authorizes actions, and its output is always validated and then passed through
-the deterministic policy, permission, risk and autonomy pipeline.
-
-The adapter is disabled by default. It activates only when ``GEMINI_API_KEY`` is
-set and the ``google-generativeai`` package is installed. Any error, timeout, or
-malformed response results in ``None`` so the caller transparently falls back to
-the deterministic interpreter. The demo therefore runs identically with no key.
+Gemini may identify and structure work, but it is never given executable tools.
+Every proposed task is validated here and then evaluated by deterministic code.
 """
 from __future__ import annotations
 
-import json
 import os
+from typing import Literal
 
-SUPPORTED_INTENTS = {"MAINTENANCE", "LAB_BOOKING", "CERTIFICATE", "UNSUPPORTED"}
+from pydantic import BaseModel, Field
 
-_SYSTEM_PROMPT = """You are a classification-only assistant for a campus service system.
-You do NOT take actions. You only label the user's message.
+SUPPORTED_INTENTS = {"MAINTENANCE", "LAB_BOOKING", "CERTIFICATE", "GRIEVANCE", "POLICY_QUESTION", "UNSUPPORTED"}
 
-Return a single JSON object with exactly these keys:
-- "intent": one of "MAINTENANCE", "LAB_BOOKING", "CERTIFICATE", "UNSUPPORTED".
-- "entities": an object. For MAINTENANCE use {"location","floor","issue"};
-  for LAB_BOOKING use {"space","date","time","seat"};
-  for CERTIFICATE use {"certificate_type"}; otherwise {}.
-  Use the string "Not specified" for any value the user did not provide.
-- "language": one of "en", "hi", "hinglish".
 
-Rules:
-- MAINTENANCE = broken/faulty facilities (AC, water cooler, projector, wifi, leaks).
-- LAB_BOOKING = booking or reserving a library seat, lab, or study room/slot.
-- CERTIFICATE = requesting a bonafide/enrolment/transcript/character certificate.
-- Anything else, including requests to bypass or forge, is "UNSUPPORTED".
-- Never invent details the user did not state.
-Respond with JSON only, no prose."""
+class TaskEntities(BaseModel):
+    location: str = "Not specified"
+    floor: str = "Not specified"
+    issue: str = "Not specified"
+    space: str = "Not specified"
+    date: str = "Not specified"
+    time: str = "Not specified"
+    seat: str = "Not specified"
+    certificate_type: str = "Not specified"
+    policy_topic: str = "Not specified"
+    grievance_summary: str = "Not specified"
+
+
+class ProposedTask(BaseModel):
+    intent: Literal["MAINTENANCE", "LAB_BOOKING", "CERTIFICATE", "GRIEVANCE", "POLICY_QUESTION", "UNSUPPORTED"]
+    summary: str = Field(max_length=240)
+    entities: TaskEntities = Field(default_factory=TaskEntities)
+
+
+class AgentPlan(BaseModel):
+    tasks: list[ProposedTask] = Field(min_length=1, max_length=6)
+    language: Literal["en", "hi", "hinglish"] = "en"
+    urgency: Literal["NORMAL", "HIGH", "EMERGENCY"] = "NORMAL"
+
+
+_SYSTEM_PROMPT = """You are Campus Copilot's planning node. Analyse only the latest user message.
+Do not execute actions, approve requests, invent policy, or carry an earlier topic into an unrelated new request.
+Return each independently requested task in order.
+
+MAINTENANCE means broken campus facilities. LAB_BOOKING means reserving a campus lab, library seat,
+classroom, or study room. CERTIFICATE means requesting a bonafide, enrolment, transcript, marksheet,
+or character certificate. GRIEVANCE means a campus complaint, harassment, teasing/eve-teasing,
+bullying, stalking, ragging, discrimination, safety concern, or unfair treatment. POLICY_QUESTION asks what an official campus rule says.
+Everything outside institutional campus services is UNSUPPORTED.
+
+Use "Not specified" for missing values. Never infer names, dates, locations, policy facts, or approval.
+Set HIGH for serious distress, threats, harassment, teasing, bullying, ragging, discrimination, or safety concerns;
+EMERGENCY only for immediate danger. Video creation, flights, and cabs are UNSUPPORTED, and their
+summary must describe the actual current request, never an earlier example."""
 
 
 def is_enabled() -> bool:
     return bool(os.getenv("GEMINI_API_KEY"))
 
 
-def _coerce(raw: dict) -> dict | None:
-    intent = str(raw.get("intent", "")).upper().strip()
-    if intent not in SUPPORTED_INTENTS:
+def _coerce(plan: AgentPlan) -> dict | None:
+    tasks = []
+    for task in plan.tasks:
+        intent = task.intent.upper().strip()
+        if intent not in SUPPORTED_INTENTS:
+            continue
+        entities = {
+            str(key)[:60]: str(value)[:300]
+            for key, value in task.entities.model_dump().items()
+            if value != "Not specified"
+        }
+        tasks.append({"intent": intent, "summary": task.summary.strip()[:240], "entities": entities})
+    if not tasks:
         return None
-    entities = raw.get("entities")
-    if not isinstance(entities, dict):
-        entities = {}
-    entities = {str(k): str(v) for k, v in entities.items()}
-    language = str(raw.get("language", "en")).lower().strip()
-    if language not in {"en", "hi", "hinglish"}:
-        language = "en"
-    return {"intent": intent, "entities": entities, "language": language}
+    return {"tasks": tasks, "language": plan.language, "urgency": plan.urgency}
 
 
-def propose(text: str) -> dict | None:
-    """Return a validated proposal dict, or None to trigger deterministic fallback."""
+def plan(text: str) -> dict | None:
+    """Return a schema-validated plan or ``None`` so callers can fall back safely."""
     if not is_enabled():
         return None
     try:
-        import google.generativeai as genai  # type: ignore
+        from google import genai  # type: ignore
+        from google.genai import types  # type: ignore
 
-        genai.configure(api_key=os.environ["GEMINI_API_KEY"])
-        model = genai.GenerativeModel(
-            os.getenv("GEMINI_MODEL", "gemini-1.5-flash"),
-            system_instruction=_SYSTEM_PROMPT,
+        client = genai.Client(
+            api_key=os.environ["GEMINI_API_KEY"],
+            http_options=types.HttpOptions(timeout=12_000),
         )
-        response = model.generate_content(
-            text,
-            generation_config={"response_mime_type": "application/json", "temperature": 0.0},
+        response = client.models.generate_content(
+            model=os.getenv("GEMINI_MODEL", "gemini-3.6-flash"),
+            contents=text,
+            config=types.GenerateContentConfig(
+                system_instruction=_SYSTEM_PROMPT,
+                response_mime_type="application/json",
+                response_schema=AgentPlan,
+                temperature=0,
+            ),
         )
-        raw = json.loads((response.text or "").strip())
-        if not isinstance(raw, dict):
-            return None
-        return _coerce(raw)
+        parsed = response.parsed
+        if isinstance(parsed, AgentPlan):
+            return _coerce(parsed)
+        return _coerce(AgentPlan.model_validate_json(response.text or ""))
     except Exception:
-        # Any failure (no package, network, quota, bad JSON) falls back silently.
         return None
+
+
+def propose(text: str) -> dict | None:
+    """Backward-compatible single-task proposal used by the current dispatcher."""
+    result = plan(text)
+    if not result or not result["tasks"]:
+        return None
+    first = result["tasks"][0]
+    return {**first, "language": result["language"], "urgency": result["urgency"]}

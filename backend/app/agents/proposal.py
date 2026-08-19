@@ -27,6 +27,17 @@ def _normalize(intent: str, entities: dict) -> dict:
 
 def propose(text: str) -> tuple[str, dict, str, str]:
     det_intent, det_entities, det_language = interpret(text)
+    # Clear, deterministic intents do not need a network round trip. Gemini is
+    # reserved for ambiguous text and explicit multi-task planning.
+    if det_intent != "UNSUPPORTED":
+        return det_intent, det_entities, det_language, "deterministic"
+    lower = text.lower()
+    clearly_external = any(term in lower for term in (
+        "flight", "airline", "book a cab", "book cab", "taxi", "make a video",
+        "create a video", "movie", "hotel booking",
+    ))
+    if clearly_external:
+        return det_intent, det_entities, det_language, "deterministic"
     llm = gemini_adapter.propose(text)
     if not llm:
         return det_intent, det_entities, det_language, "deterministic"
@@ -48,3 +59,24 @@ def propose(text: str) -> tuple[str, dict, str, str]:
     if intent == det_intent:
         return intent, det_entities, language, "gemini"
     return intent, _normalize(intent, llm.get("entities", {})), language, "gemini"
+
+
+def propose_plan(text: str) -> tuple[list[dict], str, str]:
+    """Plan multiple tasks without authorising or executing any of them."""
+    llm = gemini_adapter.plan(text)
+    if llm:
+        return llm["tasks"], llm["urgency"], "gemini"
+
+    # Conservative offline fallback: only explicit separators create tasks.
+    import re
+    parts = [part.strip(" ,.") for part in re.split(
+        r"\b(?:and also|also|then)\b|[;\n]+", text, flags=re.I
+    ) if part.strip(" ,.")]
+    if len(parts) < 2:
+        intent, entities, _, _ = propose(text)
+        return [{"intent": intent, "summary": text.strip()[:240], "entities": entities}], "NORMAL", "deterministic"
+    tasks = []
+    for part in parts[:6]:
+        intent, entities, _, _ = propose(part)
+        tasks.append({"intent": intent, "summary": part[:240], "entities": entities})
+    return tasks, "NORMAL", "deterministic"

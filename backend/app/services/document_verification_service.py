@@ -6,11 +6,12 @@ remain deterministic so a model can never approve or issue a certificate.
 from __future__ import annotations
 
 import io
-import json
 import os
 from dataclasses import dataclass, asdict
+from typing import Literal
 
 from PIL import Image, ImageStat, UnidentifiedImageError
+from pydantic import BaseModel, Field
 
 
 ALLOWED_TYPES = {"image/jpeg", "image/png", "image/webp"}
@@ -61,21 +62,35 @@ def _vision_extract(content: bytes, mime_type: str, document_type: str) -> dict 
     if not os.getenv("GEMINI_API_KEY"):
         return None
     try:
-        import google.generativeai as genai  # type: ignore
+        from google import genai  # type: ignore
+        from google.genai import types  # type: ignore
 
-        genai.configure(api_key=os.environ["GEMINI_API_KEY"])
-        model = genai.GenerativeModel(os.getenv("GEMINI_VISION_MODEL", os.getenv("GEMINI_MODEL", "gemini-1.5-flash")))
-        prompt = f"""Inspect this campus {document_type} scan. Extract evidence only; do not approve anything.
-Return one JSON object with: document_type (ID or MARKSHEET or OTHER), legible (boolean),
-full_name (string), roll_no (string), confidence (0 to 1), findings (array of short strings).
-Mark legible false when important identity text is cropped, blurred, obscured, or unreadable.
-Never infer missing text. JSON only."""
-        response = model.generate_content(
-            [prompt, {"mime_type": mime_type, "data": content}],
-            generation_config={"response_mime_type": "application/json", "temperature": 0.0},
+        class VisionEvidence(BaseModel):
+            document_type: Literal["ID", "MARKSHEET", "OTHER"]
+            legible: bool
+            full_name: str
+            roll_no: str
+            confidence: float = Field(ge=0, le=1)
+            findings: list[str] = Field(default_factory=list, max_length=5)
+
+        client = genai.Client(
+            api_key=os.environ["GEMINI_API_KEY"],
+            http_options=types.HttpOptions(timeout=20_000),
         )
-        raw = json.loads((response.text or "").strip())
-        return raw if isinstance(raw, dict) else None
+        prompt = f"""Inspect this campus {document_type} scan. Extract evidence only; do not approve anything.
+Mark legible false when important identity text is cropped, blurred, obscured, or unreadable.
+Never infer missing text."""
+        response = client.models.generate_content(
+            model=os.getenv("GEMINI_VISION_MODEL", os.getenv("GEMINI_MODEL", "gemini-3.6-flash")),
+            contents=[prompt, types.Part.from_bytes(data=content, mime_type=mime_type)],
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json", response_schema=VisionEvidence, temperature=0,
+            ),
+        )
+        parsed = response.parsed
+        if isinstance(parsed, VisionEvidence):
+            return parsed.model_dump()
+        return VisionEvidence.model_validate_json(response.text or "").model_dump()
     except Exception:
         return None
 

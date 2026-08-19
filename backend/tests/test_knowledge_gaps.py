@@ -2,7 +2,7 @@ from app.rag import retriever
 
 
 def test_unknown_policy_question_opens_deduplicated_knowledge_gap(client, student_headers, admin_headers):
-    question = "What is the hostel closing time?"
+    question = "What is the campus observatory closing time?"
     first = client.post("/api/v1/assistant", json={"text": question}, headers=student_headers).json()
     assert first["type"] == "message"
     assert "don't want to guess" in first["message"]
@@ -10,6 +10,13 @@ def test_unknown_policy_question_opens_deduplicated_knowledge_gap(client, studen
 
     second = client.post("/api/v1/assistant", json={"text": question}, headers=student_headers).json()
     assert second["knowledge_gap"]["id"] == first["knowledge_gap"]["id"]
+    explicit_policy_wording = client.post(
+        "/api/v1/assistant",
+        json={"text": "Tell me the campus observatory closing-time policy"},
+        headers=student_headers,
+    ).json()
+    assert "don't want to guess" in explicit_policy_wording["message"]
+    assert explicit_policy_wording["knowledge_gap"]["status"] == "OPEN"
     gaps = client.get("/api/v1/admin/knowledge-gaps", headers=admin_headers).json()
     gap = next(row for row in gaps if row["id"] == first["knowledge_gap"]["id"])
     assert gap["occurrences"] == 2

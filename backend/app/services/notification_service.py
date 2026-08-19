@@ -15,6 +15,7 @@ import smtplib
 import threading
 from datetime import datetime, timezone
 from email.message import EmailMessage
+from uuid import uuid4
 
 OUTBOX: list[dict] = []  # newest first
 
@@ -45,12 +46,14 @@ def notify(to: str, subject: str, body: str) -> dict:
     if not to or "@" not in to:
         return {}
     entry = {
+        "id": f"NTF-{uuid4().hex[:12].upper()}",
         "to": to,
         "subject": subject,
         "body": body,
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "channel": "email" if SMTP_HOST else "console",
         "delivered": not SMTP_HOST,  # console mode is "delivered" immediately
+        "read_at": None,
     }
     OUTBOX.insert(0, entry)
     if SMTP_HOST:
@@ -68,4 +71,13 @@ def notify(to: str, subject: str, body: str) -> dict:
 
 
 def inbox_for(email: str) -> list[dict]:
-    return [n for n in OUTBOX if n["to"] == email]
+    return [{**n, "read_at": n.get("read_at")} for n in OUTBOX if n["to"] == email]
+
+
+def mark_all_read(email: str) -> list[dict]:
+    """Mark the user's current inbox as seen without deleting its history."""
+    now = datetime.now(timezone.utc).isoformat()
+    for notification in OUTBOX:
+        if notification["to"] == email and not notification.get("read_at"):
+            notification["read_at"] = now
+    return inbox_for(email)

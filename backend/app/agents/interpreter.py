@@ -198,6 +198,13 @@ def interpret(text: str) -> tuple[str, dict, str]:
         return "LAB_BOOKING", booking_entities(text), "hinglish" if "kal" in lower else "en"
     if "bonaf" in lower.replace(" ", "") or any(w in lower for w in ("certificate", "transcript", "praman patra", "pramaan patra")):
         return "CERTIFICATE", {"certificate_type": "Bonafide certificate"}, "en"
-    if "grievance" in lower or "complain about" in lower or "complaint about" in lower or any(w in lower for w in ("harassment", "harassed", "misbehav", "ragging", "discriminat", "unfair treatment")):
+    if "grievance" in lower or "complain about" in lower or "complaint about" in lower or any(w in lower for w in ("harassment", "harassed", "abuse", "abused", "bully", "threat", "unsafe", "misbehav", "ragging", "discriminat", "unfair treatment", "teasing", "teased", "eve teasing", "molest", "catcall", "intimidat", "inappropriate touch")):
         return "GRIEVANCE", {"summary": text.strip()[:200]}, "en"
+    # Policy lookup is a supported read-only task. Keep this in the deterministic
+    # fallback so Gemini latency/quota cannot turn a valid campus-policy question
+    # into an out-of-scope request.
+    policy_terms = ("policy", "policies", "rule", "rules", "guideline", "curfew", "closing time", "opening time", "timing", "schedule", "departure")
+    campus_topics = ("hostel", "campus", "college", "library", "lab", "student", "faculty", "certificate", "complaint", "grievance", "attendance", "exam", "scholarship", "maintenance", "wifi", "id card", "transcript")
+    if any(term in lower for term in policy_terms) and any(topic in lower for topic in campus_topics):
+        return "POLICY_QUESTION", {"policy_topic": text.strip()[:200]}, "en"
     return "UNSUPPORTED", {}, "en"

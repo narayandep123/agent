@@ -28,6 +28,13 @@ def messages(db: Session, conversation_id: str) -> list[ChatMessage]:
     return db.query(ChatMessage).filter(ChatMessage.conversation_id == conversation_id).order_by(ChatMessage.id).all()
 
 
+def delete(db: Session, conversation: Conversation) -> None:
+    """Delete a thread and all of its saved turns."""
+    db.query(ChatMessage).filter(ChatMessage.conversation_id == conversation.id).delete(synchronize_session=False)
+    db.delete(conversation)
+    db.commit()
+
+
 def add_message(db: Session, conversation: Conversation, role: str, text: str, payload: dict | None) -> ChatMessage:
     if role not in {"user", "assistant", "decision"}:
         raise ValueError("Invalid chat message role.")
