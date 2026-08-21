@@ -6,9 +6,13 @@ from sqlalchemy.orm import Session
 from app.auth.deps import get_current_user, require_admin
 from app.auth.security import create_token, hash_password, verify_password
 from app.db import get_db
-from app.db_models import User
-from app.schemas.auth import AccessInput, LoginInput, SignupInput, TokenOut, UserDecisionInput, UserOut
+from app.db_models import ChatMessage, Conversation, EmailVerification, KnowledgeGap, User
+from app.schemas.auth import (AccessInput, EmailResendInput, EmailVerificationInput, LoginInput,
+                              SignupInput, TokenOut, UserDecisionInput, UserOut)
 from app.services import audit_service
+from app.services import email_verification_service
+from app.services import maintenance_attachment_service, notification_service, request_service
+from app.services.booking_service import BOOKINGS
 from app.services.notification_service import notify
 
 router = APIRouter(prefix="/api/v1/auth", tags=["auth"])
@@ -30,7 +34,7 @@ def signup(payload: SignupInput, db: Session = Depends(get_db)):
         raise HTTPException(409, "An account with this email already exists.")
     if roll_no and db.query(User).filter(func.upper(User.roll_no) == roll_no).first():
         raise HTTPException(409, "An account with this roll / employee number already exists.")
-    status = "ACTIVE" if role in SELF_ENROLL_ROLES else "PENDING"
+    status = "EMAIL_PENDING"
     user = User(
         name=payload.name,
         roll_no=roll_no,
@@ -43,21 +47,50 @@ def signup(payload: SignupInput, db: Session = Depends(get_db)):
     db.add(user)
     db.commit()
     db.refresh(user)
-    audit_service.record(f"USER-{user.id}", user.email, "SIGNUP", status, f"Role {role}", "LOW")
+    email_verification_service.issue(db, user)
+    audit_service.record(f"USER-{user.id}", user.email, "SIGNUP", status, f"Role {role}; email verification required", "LOW")
+    return {
+        "pending": True, "verification_required": True, "email": user.email,
+        "message": "We sent a six-digit verification code to your email address.",
+    }
+
+
+@router.post("/verify-email")
+def verify_email(payload: EmailVerificationInput, db: Session = Depends(get_db)):
+    email = str(payload.email).strip().lower()
+    user = db.query(User).filter(func.lower(User.email) == email).first()
+    if not user or user.status != "EMAIL_PENDING":
+        raise HTTPException(400, "This email does not have a pending verification.")
+    try:
+        status = email_verification_service.verify(db, user, payload.code)
+    except ValueError as error:
+        raise HTTPException(400, str(error))
+    audit_service.record(f"USER-{user.id}", user.email, "EMAIL_VERIFICATION", "VERIFIED", f"Role {user.role}", "LOW")
     if status == "ACTIVE":
         return {
-            "pending": False,
-            "access_token": create_token(user),
-            "token_type": "bearer",
+            "verified": True, "pending_approval": False,
+            "access_token": create_token(user), "token_type": "bearer",
             "user": UserOut.model_validate(user).model_dump(),
+            "message": "Email verified. Your account is ready.",
         }
     notify(user.email, "CampusFlow enrolment request received",
-           f"Hi {user.name},\n\nWe've received your request to join CampusFlow as {role.title()}. "
-           f"An administrator will review it shortly and you'll be notified once you're enrolled.\n\n— CampusFlow AI")
+           f"Hi {user.name},\n\nYour email is verified. Your {user.role.title()} account now requires "
+           "administrator approval before sign-in.\n\n— CampusFlow AI")
     return {
-        "pending": True,
-        "message": "Your account requires administrator approval. You'll be able to sign in once an admin enrols you.",
+        "verified": True, "pending_approval": True,
+        "message": "Email verified. Your account is awaiting administrator approval.",
     }
+
+
+@router.post("/resend-verification")
+def resend_verification(payload: EmailResendInput, db: Session = Depends(get_db)):
+    email = str(payload.email).strip().lower()
+    user = db.query(User).filter(func.lower(User.email) == email).first()
+    if user and user.status == "EMAIL_PENDING":
+        email_verification_service.issue(db, user)
+        audit_service.record(f"USER-{user.id}", user.email, "EMAIL_VERIFICATION", "RESENT", "New code issued", "LOW")
+    # Deliberately generic so this endpoint cannot be used for account discovery.
+    return {"message": "If this email has a pending verification, a new code has been sent."}
 
 @router.post("/login", response_model=TokenOut)
 def login(payload: LoginInput, db: Session = Depends(get_db)):
@@ -66,6 +99,7 @@ def login(payload: LoginInput, db: Session = Depends(get_db)):
         raise HTTPException(401, "Invalid email or password.")
     if user.status != "ACTIVE":
         messages = {
+            "EMAIL_PENDING": "Please verify your email address before signing in.",
             "PENDING": "Your account is awaiting administrator approval.",
             "REJECTED": "Your enrolment request was declined. Please contact the administrator.",
             "REVOKED": "Your access has been revoked by an administrator. Please contact the administrator.",
@@ -121,8 +155,8 @@ def set_access(user_id: int, payload: AccessInput, admin: User = Depends(require
         raise HTTPException(404, "User not found")
     if user.id == admin.id:
         raise HTTPException(400, "You cannot change your own access.")
-    if user.status == "PENDING":
-        raise HTTPException(409, "This account is still awaiting approval. Use approve or reject instead.")
+    if user.status in {"EMAIL_PENDING", "PENDING"}:
+        raise HTTPException(409, "This account is still awaiting verification or approval and cannot be changed here.")
     user.status = "ACTIVE" if payload.active else "REVOKED"
     user.comment = payload.comment
     db.commit()
@@ -138,3 +172,41 @@ def set_access(user_id: int, payload: AccessInput, admin: User = Depends(require
         notify(user.email, "Your CampusFlow access has been revoked",
                f"Hi {user.name},\n\nYour access to CampusFlow has been revoked by an administrator.\n\n" + (f"Reason: {payload.comment}\n\n" if payload.comment else "") + "Please contact the administrator if you believe this is a mistake.\n\n— CampusFlow AI")
     return UserOut.model_validate(user)
+
+
+@admin_router.delete("/users/{user_id}")
+def delete_user(user_id: int, admin: User = Depends(require_admin), db: Session = Depends(get_db)):
+    """Permanently remove an account and its user-owned operational data."""
+    user = db.get(User, user_id)
+    if not user:
+        raise HTTPException(404, "User not found")
+    if user.id == admin.id:
+        raise HTTPException(400, "You cannot delete your own administrator account.")
+
+    email = user.email
+    conversations = db.query(Conversation).filter(Conversation.user_id == user.id).all()
+    conversation_ids = [row.id for row in conversations]
+    if conversation_ids:
+        db.query(ChatMessage).filter(ChatMessage.conversation_id.in_(conversation_ids)).delete(synchronize_session=False)
+        db.query(Conversation).filter(Conversation.id.in_(conversation_ids)).delete(synchronize_session=False)
+    db.query(EmailVerification).filter(EmailVerification.user_id == user.id).delete(synchronize_session=False)
+    db.query(KnowledgeGap).filter(KnowledgeGap.requested_by == email).update(
+        {KnowledgeGap.requested_by: f"deleted-user-{user.id}"}, synchronize_session=False,
+    )
+
+    request_ids = [rid for rid, request in request_service.REQUESTS.items() if request.user_id == email]
+    for request_id in request_ids:
+        maintenance_attachment_service.delete_for_request(request_id)
+        request_service.REQUESTS.pop(request_id, None)
+    for key, owner in list(BOOKINGS.items()):
+        if owner == email:
+            BOOKINGS.pop(key, None)
+    notification_service.OUTBOX[:] = [item for item in notification_service.OUTBOX if item.get("to") != email]
+
+    db.delete(user)
+    db.commit()
+    audit_service.record(f"USER-{user_id}", admin.email, "USER_DELETE", "DELETED", "RBAC administrator action", "HIGH")
+    return {
+        "deleted": True, "user_id": user_id,
+        "message": "User deleted and account access removed immediately.",
+    }

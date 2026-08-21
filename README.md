@@ -38,8 +38,10 @@ pytest
 
 ## Architecture
 
+![CampusFlow AI Trust Gateway](docs/images/campusflow-trust-gateway.png)
+
 `User → interpretation → policy guardian → RBAC → risk engine → autonomy engine → controlled tool → audit`
 
 The LLM integration is deliberately not required for the demo: intent extraction has a transparent deterministic fallback. Add Gemini only as a proposal-generation adapter; it must never execute tools directly.
 
-Further module details: [docs/architecture.md](docs/architecture.md). Demo flow: [docs/demo-script.md](docs/demo-script.md).
+See the [hackathon architecture and agent-flow diagrams](docs/architecture.md) and the [demo script](docs/demo-script.md).

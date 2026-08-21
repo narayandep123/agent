@@ -91,8 +91,20 @@ def booking_entities(text: str) -> dict:
     lower = text.lower()
     room = re.search(r"(?:library|lab|room)\s*(20[1-5])", lower)
     seat = re.search(r"\bseat\s*([a-z])\b", lower)
+    if room:
+        space = f"Library {room.group(1)}"
+    elif "library seat" in lower or "seat in the library" in lower:
+        space = "Library seat"
+    elif "study room" in lower or "reading room" in lower:
+        space = "Study room"
+    elif re.search(r"\blab(?:oratory)?\b", lower):
+        space = "Laboratory"
+    elif "library" in lower:
+        space = "Library"
+    else:
+        space = "Not specified"
     return {
-        "space": f"Library {room.group(1)}" if room else "Not specified",
+        "space": space,
         "time": _parse_time(lower),
         "date": _parse_date(lower),
         "seat": seat.group(1).upper() if seat else "Auto assign",
@@ -188,17 +200,40 @@ def maintenance_entities(text: str) -> dict:
 
 def interpret(text: str) -> tuple[str, dict, str]:
     lower = text.lower()
+    # Normalize a small, high-value typo vocabulary before deterministic routing.
+    # This is deliberately bounded: fuzzy matching every word can turn unrelated
+    # messages into actions, while these variants preserve the user's meaning.
+    normalized = lower
+    for typo, canonical in {
+        "compalint": "complaint", "compliant": "complaint", "complint": "complaint",
+        "maintainance": "maintenance", "maintanance": "maintenance",
+        "bonafied": "bonafide", "bonified": "bonafide",
+        "scholorship": "scholarship", "eligibilty": "eligibility",
+        "availablity": "availability",
+    }.items():
+        normalized = re.sub(rf"\b{re.escape(typo)}\b", canonical, normalized)
+    lower = normalized
+    text = normalized
     maintenance = maintenance_entities(text)
     if maintenance["issue"] != "Not specified":
         return "MAINTENANCE", maintenance, "hinglish" if any(w in lower for w in ("kaam nahi", "kharab")) else "en"
     # A generic word such as "book" is not enough: flights, hotels and tickets
     # are outside CampusFlow. Require an actual campus space/resource.
-    if any(w in lower for w in ("library", "lab", "study room", "reading room", "computer room", "classroom", "seat")) \
-            or ("room" in lower and any(w in lower for w in ("book", "booking", "reserve"))):
+    external_booking = any(w in lower for w in ("flight", "airline", "cab", "taxi", "hotel"))
+    if not external_booking and (
+        any(w in lower for w in (
+            "library", "lab", "study room", "reading room", "computer room", "classroom", "seat",
+        )) or ("room" in lower and any(w in lower for w in ("book", "booking", "reserve")))
+    ):
         return "LAB_BOOKING", booking_entities(text), "hinglish" if "kal" in lower else "en"
-    if "bonaf" in lower.replace(" ", "") or any(w in lower for w in ("certificate", "transcript", "praman patra", "pramaan patra")):
+    if not external_booking and any(w in lower for w in ("get a slot", "need a slot", "book me", "reserve a slot", "check availability")):
+        return "LAB_BOOKING", booking_entities(text), "hinglish" if "kal" in lower else "en"
+    if "bonaf" in lower.replace(" ", "") or any(w in lower for w in (
+        "certificate", "transcript", "praman patra", "pramaan patra", "proof of enrollment",
+        "proof of enrolment", "enrollment proof", "enrolment proof",
+    )):
         return "CERTIFICATE", {"certificate_type": "Bonafide certificate"}, "en"
-    if "grievance" in lower or "complain about" in lower or "complaint about" in lower or any(w in lower for w in ("harassment", "harassed", "abuse", "abused", "bully", "threat", "unsafe", "misbehav", "ragging", "discriminat", "unfair treatment", "teasing", "teased", "eve teasing", "molest", "catcall", "intimidat", "inappropriate touch")):
+    if "grievance" in lower or "complain about" in lower or "complaint about" in lower or any(w in lower for w in ("harassment", "harassed", "abuse", "abused", "bully", "threat", "unsafe", "misbehav", "ragging", "discriminat", "unfair treatment", "this is unfair", "teasing", "teased", "eve teasing", "molest", "catcall", "intimidat", "inappropriate touch")):
         return "GRIEVANCE", {"summary": text.strip()[:200]}, "en"
     # Policy lookup is a supported read-only task. Keep this in the deterministic
     # fallback so Gemini latency/quota cannot turn a valid campus-policy question
@@ -206,5 +241,12 @@ def interpret(text: str) -> tuple[str, dict, str]:
     policy_terms = ("policy", "policies", "rule", "rules", "guideline", "curfew", "closing time", "opening time", "timing", "schedule", "departure")
     campus_topics = ("hostel", "campus", "college", "library", "lab", "student", "faculty", "certificate", "complaint", "grievance", "attendance", "exam", "scholarship", "maintenance", "wifi", "id card", "transcript")
     if any(term in lower for term in policy_terms) and any(topic in lower for topic in campus_topics):
+        return "POLICY_QUESTION", {"policy_topic": text.strip()[:200]}, "en"
+    # Rules are often requested without saying "policy": deadlines, eligibility,
+    # timings, requirements and procedures are still institutional fact questions.
+    if any(topic in lower for topic in campus_topics) and any(term in lower for term in (
+        "eligible", "eligibility", "deadline", "last date", "requirement", "requirements",
+        "allowed", "permitted", "how do i", "how can i", "when can", "what time",
+    )):
         return "POLICY_QUESTION", {"policy_topic": text.strip()[:200]}, "en"
     return "UNSUPPORTED", {}, "en"

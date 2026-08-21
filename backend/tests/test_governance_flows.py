@@ -33,6 +33,17 @@ def test_review_requires_admin(client, student_headers):
     assert reviewed.status_code == 403
 
 
+def test_admin_cannot_review_their_own_request(client, admin_headers):
+    created = _grievance(client, admin_headers, "I want to file a grievance about unfair treatment")
+    reviewed = client.post(
+        f"/api/v1/approvals/{created['request_id']}",
+        json={"approved": True},
+        headers=admin_headers,
+    )
+    assert reviewed.status_code == 403
+    assert "different authorized administrator" in reviewed.json()["detail"]
+
+
 def test_review_on_unknown_request_is_404(client, admin_headers):
     r = client.post("/api/v1/approvals/does-not-exist", json={"approved": True}, headers=admin_headers)
     assert r.status_code == 404

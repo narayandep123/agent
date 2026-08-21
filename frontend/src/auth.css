@@ -16,6 +16,7 @@
 .auth-error{background:rgba(239,68,68,.12);border:1px solid rgba(239,68,68,.4);color:#fca5a5;padding:10px 12px;border-radius:10px;font-size:.82rem;margin:0 0 14px;}
 .auth-note{background:rgba(16,185,129,.12);border:1px solid rgba(16,185,129,.4);color:#6ee7b7;padding:10px 12px;border-radius:10px;font-size:.82rem;margin:0 0 14px;display:flex;gap:8px;align-items:flex-start;line-height:1.4;}
 .auth-foot{text-align:center;font-size:.72rem;color:#475569;margin:18px 0 0;}
+.verify-copy{margin:0;color:#94a3b8;font-size:.82rem;line-height:1.5}.verify-copy b{color:#e2e8f0}.code-input{text-align:center;font-size:1.35rem!important;letter-spacing:.35em;font-weight:700}.resend-code{display:block;margin:12px auto 0;border:0;background:transparent;color:#60a5fa;font:600 .8rem inherit;cursor:pointer}.resend-code:disabled{opacity:.55}
 
 /* ---- Profile / admin extras ---- */
 .profile-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:14px;margin:18px 0 22px;}
@@ -34,8 +35,10 @@
 .tag-status{display:inline-block;padding:3px 10px;border-radius:999px;font-size:.68rem;font-weight:700;letter-spacing:.04em;}
 .tag-status.active{background:rgba(16,185,129,.15);color:#6ee7b7;}
 .tag-status.pending{background:rgba(245,158,11,.15);color:#fcd34d;}
+.tag-status.email_pending{background:rgba(59,130,246,.15);color:#93c5fd;}
 .tag-status.revoked,.tag-status.rejected{background:rgba(239,68,68,.15);color:#fca5a5;}
 .you-tag{color:#64748b;font-size:.8rem;font-style:italic;}
+.rowactions .delete-user{border:1px solid #7f1d1d;background:#2a1118;color:#fca5a5;border-radius:6px;font:700 12px inherit;padding:7px 12px;cursor:pointer;display:inline-flex;align-items:center;gap:5px}.rowactions .delete-user:hover{background:#450a0a;border-color:#ef4444}
 
 /* ---- Notifications ---- */
 .notif-list{display:flex;flex-direction:column;gap:12px;margin-top:14px;}

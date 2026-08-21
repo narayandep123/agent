@@ -28,6 +28,18 @@ class User(Base):
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 
+class EmailVerification(Base):
+    """Short-lived, hashed signup verification challenge."""
+
+    __tablename__ = "email_verifications"
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, unique=True, index=True)
+    code_hash = Column(String, nullable=False)
+    expires_at = Column(DateTime, nullable=False)
+    attempts = Column(Integer, default=0)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+
 class Conversation(Base):
     """A durable, user-owned assistant thread."""
 

@@ -20,6 +20,9 @@ from app.services import conversation_service
 from app.services import knowledge_gap_service
 from app.services.document_verification_service import verify as verify_document
 from app.services import maintenance_attachment_service
+from app.services.booking_service import suggest_slot
+from app.services.prompt_injection_service import contains_override_attempt, inspect_text
+from app.services.tone_service import analyze as analyze_tone
 import re
 
 router = APIRouter(prefix="/api/v1")
@@ -33,11 +36,15 @@ LAST_MAINTENANCE_ENTITIES: dict[str, dict] = {}
 # Remembers the last policy a user was reading about, so a vague follow-up like
 # "details about policy?" or "tell me more" continues on the same document.
 LAST_POLICY: dict[str, str] = {}
+# Paused workflows are kept separately from the currently active workflow. This
+# lets a user change topics without losing already collected slots.
+SUSPENDED_TASKS: dict[str, dict[str, dict]] = {}
+CONTEXT_NOTES: dict[str, str] = {}
 
 AFFIRM_WORDS = {"yes", "y", "yeah", "yep", "yup", "confirm", "confirmed", "ok", "okay", "sure", "proceed", "book it", "go ahead", "haan", "done", "theek hai", "thik hai", "perfect", "great", "yes please", "please do", "haan ji"}
 CANCEL_WORDS = {"no", "nope", "cancel", "stop", "abort", "nah", "nahi", "never mind", "nevermind", "forget it", "leave it", "not now", "no thanks", "rehne do"}
 QUESTION_STARTERS = {"how", "what", "when", "where", "who", "whom", "why", "which", "whose", "is", "are", "do", "does", "can", "could", "should", "am", "will", "may"}
-ACTION_TERMS = ("book ", "reserve", "cancel", "not working", "broken", "leaking", "i need", "i want", "raise a", "log a", "create a", "report a", "fix ", "repair", "issue a", "apply for")
+ACTION_TERMS = ("book ", "book me", "get a slot", "need a slot", "reserve", "check availability", "cancel", "not working", "broken", "leaking", "i need", "i want", "raise a", "log a", "create a", "report a", "fix ", "repair", "issue a", "apply for")
 CAMPUS_TERMS = (
     "campus", "college", "student", "faculty", "hostel", "library", "lab", "classroom",
     "certificate", "bonafide", "transcript", "marksheet", "enrollment", "enrolment",
@@ -104,20 +111,54 @@ def _policy_answers_exact_fact(question: str, policy: dict) -> bool:
         any(phrase in low for phrase in ("closing time", "opening time", "curfew time", "what time"))
         or bool(re.search(r"\bwhen\b.{0,30}\b(?:close|open|curfew)", low))
     )
-    asks_for_schedule = any(term in low for term in ("schedule", "departure", "arrival time"))
-    if not (asks_for_time or asks_for_schedule):
-        return True
     corpus_text = " ".join(
         [policy.get("answer", "")] + [body for _, body in policy.get("sections", [])]
     ).lower()
+    asks_for_schedule = any(term in low for term in ("schedule", "departure", "arrival time"))
+    asks_for_deadline = any(term in low for term in ("deadline", "last date", "due date", "submission date"))
+    asks_for_amount = bool(re.search(r"\b(?:how much|fee|fees|cost|price|charge|amount)\b", low))
+    asks_for_count = bool(re.search(r"\b(?:how many|number of|count)\b", low))
+    asks_for_duration = bool(re.search(r"\b(?:how long|duration|turnaround|processing time)\b", low))
+
+    # If the user proposes a concrete value ("Does it close at 9?"), that value
+    # must itself occur in policy context. Topical similarity is not evidence.
+    proposed_values = set(re.findall(r"\b\d+(?::\d+)?\b", low))
+    corpus_values = set(re.findall(r"\b\d+(?::\d+)?\b", corpus_text))
+    if proposed_values and not proposed_values.issubset(corpus_values):
+        return False
+
+    explicit_time = re.search(r"\b(?:[01]?\d|2[0-3]):[0-5]\d\b|\b\d{1,2}\s*(?:a\.?m\.?|p\.?m\.?)\b|\b(?:noon|midnight)\b", corpus_text)
+    explicit_date = re.search(
+        r"\b\d{4}-\d{2}-\d{2}\b|\b\d{1,2}\s+(?:january|february|march|april|may|june|july|august|september|october|november|december)\b",
+        corpus_text,
+    )
+    explicit_amount = re.search(r"(?:₹|rs\.?|inr|\$)\s*\d|\b(?:free|no fee|no charge)\b", corpus_text)
+    explicit_count = re.search(r"\b\d+\b|\b(?:one|two|three|four|five|six|seven|eight|nine|ten)\b", corpus_text)
+    explicit_duration = re.search(r"\b\d+\s*(?:working\s+)?(?:minute|hour|day|week|month|year)s?\b", corpus_text)
+    if asks_for_deadline and not explicit_date:
+        return False
+    if asks_for_amount and not explicit_amount:
+        return False
+    if asks_for_count and not explicit_count:
+        return False
+    if asks_for_duration and not explicit_duration:
+        return False
+    if not any((asks_for_time, asks_for_schedule)):
+        return True
     subject_stop = {
         "what", "when", "tell", "about", "campus", "policy", "policies", "closing",
         "opening", "close", "open", "time", "timing", "schedule", "departure", "arrival",
     }
     subjects = {word for word in re.findall(r"[a-z]+", low) if len(word) > 3 and word not in subject_stop}
     subject_matches = not subjects or any(subject in corpus_text for subject in subjects)
-    explicit_time = re.search(r"\b(?:[01]?\d|2[0-3]):[0-5]\d\b|\b\d{1,2}\s*(?:a\.?m\.?|p\.?m\.?)\b|\b(?:noon|midnight)\b", corpus_text)
     return bool(explicit_time) and subject_matches
+
+def _knowledge_gap_text(gap_id: str, suffix: str = "") -> str:
+    message = (
+        "I don't have verified information on this in our policy documents. I don't want to guess. "
+        f"I've raised knowledge request {gap_id} for an administrator to add or update the relevant policy."
+    )
+    return f"{message} {suffix}".strip()
 
 
 def _info_answer(user_key: str, text_en: str) -> str | None:
@@ -189,6 +230,143 @@ def _message(text: str, lang: str, *, sources: list[dict] | None = None, **extra
     return {"type": "message", "message": translator.localize(text, lang), "language": lang,
             "sources": sources or [], **extra}
 
+def _needs_input_clarification(text: str, has_active_workflow: bool = False) -> bool:
+    clean = text.strip()
+    if not clean or not any(char.isalnum() for char in clean):
+        return True
+    compact = re.sub(r"\W+", "", clean.lower(), flags=re.UNICODE)
+    if len(set(compact)) <= 1 or compact in {"asdf", "asdfgh", "asdfghjkl", "qwerty", "qwertyuiop", "xyzxyz"}:
+        return True
+    if not has_active_workflow and _clean(text) in {"ok", "okay", "hmm", "uh", "test", "anything", "something", "idk"}:
+        return True
+    return False
+
+def _buried_action(text: str, intent: str) -> str | None:
+    """Extract one explicit action sentence from a long contextual message."""
+    if len(text.split()) < 45 or intent not in {"MAINTENANCE", "LAB_BOOKING", "CERTIFICATE", "GRIEVANCE"}:
+        return None
+    terms = {
+        "MAINTENANCE": ("broken", "not working", "repair", "maintenance", "fix", "kharab"),
+        "LAB_BOOKING": ("book", "reserve", "library", "lab", "seat"),
+        "CERTIFICATE": ("certificate", "bonafide", "transcript"),
+        "GRIEVANCE": ("complaint", "grievance", "harass", "ragging", "abuse", "threat"),
+    }[intent]
+    sentences = [part.strip() for part in re.split(r"(?<=[.!?])\s+|[;\n]+", text) if part.strip()]
+    candidates = [sentence for sentence in sentences if any(term in sentence.lower() for term in terms)]
+    if len(candidates) != 1:
+        return None
+    return candidates[0][:220]
+
+def _queue_context_note(user_key: str, note: str) -> None:
+    existing = CONTEXT_NOTES.get(user_key, "")
+    CONTEXT_NOTES[user_key] = f"{existing} {note}".strip()
+
+def _workflow_kind(state: dict) -> str | None:
+    if state.get("stage") in {"collecting", "confirming"}:
+        return "booking"
+    flow = state.get("flow")
+    return {
+        "maintenance": "maintenance", "certificate": "certificate",
+        "complaint_intake": "grievance", "offer_complaint": "grievance",
+    }.get(flow)
+
+def _intent_kind(intent: str) -> str | None:
+    return {
+        "MAINTENANCE": "maintenance", "LAB_BOOKING": "booking",
+        "CERTIFICATE": "certificate", "GRIEVANCE": "grievance",
+        "POLICY_QUESTION": "policy",
+    }.get(intent)
+
+def _continues_workflow(kind: str, text: str) -> bool:
+    low = text.lower()
+    if _is_affirmative(text) or _is_cancel(text) or _is_frustrated(text):
+        return True
+    if kind == "booking":
+        return _has_booking_detail(text) or any(term in low for term in ("tomorrow", "today", "morning", "afternoon", "evening"))
+    if kind == "maintenance":
+        parsed = maintenance_entities(text)
+        return (
+            any(parsed.get(key, "Not specified") != "Not specified" for key in ("issue", "location", "floor"))
+            or bool(parse_floor(text, loose=True))
+            or any(term in low for term in ("don't know", "dont know", "not know", "no more detail", "nothing else", "not available", "instead"))
+        )
+    if kind == "certificate":
+        return _mentions_certificate_context(text) or any(term in low for term in ("what document", "which document", "requirement", "needed"))
+    if kind == "grievance":
+        return True  # free-form descriptions are valid complaint details
+    return False
+
+def _clearly_starts_kind(kind: str | None, text: str) -> bool:
+    low = text.lower()
+    if kind == "booking":
+        return any(term in low for term in ("book", "reserve", "booking"))
+    if kind == "maintenance":
+        return any(term in low for term in ("broken", "not working", "repair", "fix", "leak", "damaged", "kharab"))
+    if kind == "grievance":
+        return any(term in low for term in ("complaint", "grievance", "harass", "ragging", "abuse", "bully", "teas", "threat"))
+    if kind == "certificate":
+        return "certificate" in low and any(term in low for term in ("need", "want", "apply", "request"))
+    if kind == "policy":
+        return any(term in low for term in ("policy", "policies", "rule", "guideline", "procedure"))
+    return False
+
+def _suspend_workflow(user_key: str, state: dict, incoming_kind: str | None) -> None:
+    kind = _workflow_kind(state)
+    if not kind:
+        return
+    SUSPENDED_TASKS.setdefault(user_key, {})[kind] = dict(state)
+    CONVERSATION.pop(user_key, None)
+    label = {"booking": "booking", "maintenance": "maintenance request",
+             "certificate": "certificate request", "grievance": "complaint"}[kind]
+    CONTEXT_NOTES[user_key] = (
+        f"I’ve paused your unfinished {label} and switched to the new topic. "
+        "The details you already provided are saved, so you can resume it later."
+    )
+
+def _resume_workflow(user_key: str, text: str, intent: str) -> dict:
+    """Restore a matching workflow, including terse replies to its missing slot."""
+    suspended = SUSPENDED_TASKS.get(user_key, {})
+    kind = _intent_kind(intent)
+    if kind not in suspended and len(suspended) == 1 and re.search(
+        r"\b(?:resume|continue|return to|go back to|pick up)\b", text.lower()
+    ):
+        kind = next(iter(suspended))
+    if kind not in suspended:
+        if "maintenance" in suspended:
+            parsed = maintenance_entities(text)
+            state = suspended["maintenance"]
+            prior = LAST_MAINTENANCE_ENTITIES.get(user_key, {})
+            supplies_slot = any(parsed.get(key, "Not specified") != "Not specified" for key in ("issue", "location", "floor"))
+            supplies_floor = prior.get("floor", "Not specified") == "Not specified" and bool(parse_floor(text, loose=True))
+            if supplies_slot or supplies_floor:
+                kind = "maintenance"
+        if kind not in suspended and "booking" in suspended and _has_booking_detail(text):
+            kind = "booking"
+    if kind not in suspended:
+        return {}
+    state = suspended.pop(kind)
+    if not suspended:
+        SUSPENDED_TASKS.pop(user_key, None)
+    CONVERSATION[user_key] = state
+    label = {"booking": "booking", "maintenance": "maintenance request",
+             "certificate": "certificate request", "grievance": "complaint"}[kind]
+    CONTEXT_NOTES[user_key] = f"Welcome back to your {label}. I’ve restored the details you already provided."
+    return state
+
+def _apply_context_note(result: dict, user_key: str, lang: str) -> dict:
+    note = CONTEXT_NOTES.pop(user_key, "")
+    if not note:
+        return result
+    note = translator.localize(note, lang)
+    if result.get("type") == "compound":
+        result.setdefault("outputs", []).insert(0, {"type": "message", "message": note, "sources": []})
+    elif result.get("type") == "decision":
+        result["decision"]["message"] = f"{note} {result['decision'].get('message', '')}".strip()
+    else:
+        result["message"] = f"{note} {result.get('message', '')}".strip()
+    result["context_switched"] = True
+    return result
+
 def _is_affirmative(text: str) -> bool:
     cleaned = _clean(text)
     return cleaned in AFFIRM_WORDS or cleaned.startswith(("yes", "confirm", "sure", "go ahead", "book it"))
@@ -196,6 +374,18 @@ def _is_affirmative(text: str) -> bool:
 def _is_cancel(text: str) -> bool:
     cleaned = _clean(text)
     return cleaned in CANCEL_WORDS or cleaned.startswith(("cancel", "stop", "abort", "never mind", "nevermind"))
+
+_FRUSTRATION_TERMS = (
+    "already told", "already shared", "said already", "told you before", "how many times",
+    "stop asking", "don't ask again", "dont ask again", "same question", "again and again",
+    "just do it", "whatever", "are you listening", "this is frustrating", "so frustrating",
+    "pehle hi", "bata chuka", "bata chuki", "kitni baar", "bar bar", "baar baar",
+    "phir se", "same cheez", "bas karo", "kar do", "maine diya", "maine bataya",
+)
+
+def _is_frustrated(text: str) -> bool:
+    """Recognize repetition-annoyance without asking an LLM to infer mood."""
+    return analyze_tone(text).frustrated
 
 _COMPLAINT_RE = re.compile(r"\b(file|filing|lodge|make|raise|register|submit|put)\b[a-z ]{0,10}\bcomplaint", re.I)
 _COMPLAIN_RE = re.compile(r"\b(want|like|need|wish|how|can|could|would|do|to)\b[a-z ]{0,14}\bcomplain\b", re.I)
@@ -218,6 +408,227 @@ def _has_maintenance_detail(text: str) -> bool:
     # "near hostel A" from being hijacked by the maintenance workflow.
     return parsed.get("issue", "Not specified") != "Not specified"
 
+def _targeted_clarification(text: str, turn=None) -> str | None:
+    """Return one bounded disambiguation question for a fresh vague request."""
+    low = text.lower().strip()
+    if _clean(text) in {"hi", "hello", "hey", "hii", "help", "namaste"}:
+        return None
+    # A clearly phrased information request is already unambiguous even when its
+    # subject also names another workflow (for example "certificate policy").
+    # Let RAG answer it instead of asking the user to choose policy/certificate.
+    explicit_policy_request = any(term in low for term in (
+        "policy", "policies", "rule", "rules", "guideline", "guidelines", "procedure", "procedures",
+    )) and (_is_question(text) or low.startswith(("tell", "explain", "show", "what", "give", "can i know")))
+    if explicit_policy_request:
+        return None
+    booking = any(term in low for term in ("book", "reserve", "booking"))
+    maintenance = any(term in low for term in (
+        "broken", "not working", "repair", "fix", "leak", "fault", "damaged", "kharab", "kaam nahi",
+    ))
+    grievance = any(term in low for term in (
+        "complaint", "grievance", "harass", "unfair", "abuse", "ragging", "teas", "bully",
+        "stalk", "threat", "violence", "assault", "unsafe",
+    ))
+    policy = any(term in low for term in ("policy", "policies", "rule", "rules", "guideline", "procedure"))
+    certificate = any(term in low for term in ("certificate", "bonafide", "transcript", "marksheet"))
+    plausible = [name for name, present in (
+        ("booking", booking), ("maintenance", maintenance), ("grievance", grievance),
+        ("policy", policy), ("certificate", certificate),
+    ) if present]
+    if len(plausible) > 1:
+        if booking and maintenance:
+            return "Should I report the facility problem, help book a campus space, or handle both as separate tasks?"
+        if grievance and maintenance:
+            return "Is this a broken facility to send to maintenance, or a personal/administrative grievance for human review?"
+        return f"Should I handle this as {', '.join(plausible[:-1])} or {plausible[-1]}?"
+    if "hostel" in low and not any((maintenance, grievance, policy)):
+        return "Is this about a hostel facility problem, a personal/safety complaint, or a hostel policy?"
+    if any(term in low for term in ("room", "lab", "library")) and not any((booking, maintenance, policy)):
+        return "Do you want to book that campus space or report something broken there?"
+    if certificate and not any(term in low for term in ("need", "want", "apply", "request", "how", "what", "require")):
+        return "Do you want to request the certificate or ask about its requirements?"
+    if grievance and not any(term in low for term in ("happened", "against", "about", "because", "at ", "near ")):
+        return "Is this complaint about a facility fault or a personal/administrative grievance?"
+    words = re.findall(r"[a-zA-Z\u0900-\u097F]+", low)
+    if len(words) <= 8 and any(term in low for term in (
+        "issue", "issues", "problem", "problems", "request", "need help", "want to report", "madad",
+    )):
+        return "Which campus service is this about: maintenance, booking, certificate, policy, or a complaint?"
+    return None
+
+def _asks_own_identity(text: str) -> bool:
+    clean = _clean(text)
+    return bool(re.search(
+        r"\b(?:do you know me|know me|who am i|who i am|who (?:are you|r u) talking to|"
+        r"what (?:do you know|you know) about me|what is my (?:name|role)|do you remember me|"
+        r"which user am i|what account am i using|who is this account|"
+        r"am i (?:logged|signed) in as(?: a| an)?)\b",
+        clean,
+    ))
+
+def _own_identity_message(user: User, lang: str) -> dict:
+    return _message(
+        f"I know you as {user.name}, signed in with the authenticated role {user.role.title()}. "
+        "I use only the account and conversation information you are authorized to access.",
+        lang, authenticated_user={"name": user.name, "role": user.role},
+    )
+
+def _out_of_scope_message(text: str, lang: str) -> dict:
+    """Give a specific boundary response instead of repeating one stock paragraph."""
+    low = text.lower()
+    if any(term in low for term in ("video", "poem", "story", "creative writing", "song", "image")):
+        lead = "I can’t create that content in CampusFlow."
+    elif any(term in low for term in ("homework", "assignment answer", "solve this", "exam answer")):
+        lead = "I can’t provide homework or examination answers through CampusFlow."
+    elif any(term in low for term in ("flight", "airline", "cab", "taxi", "hotel")):
+        lead = "I can’t arrange that external travel or accommodation service."
+    elif _is_question(text):
+        lead = "That question isn’t connected to an institutional service I can verify or perform."
+    else:
+        lead = "That request is outside the institutional services available in CampusFlow."
+    return _message(
+        lead + " I can help with campus maintenance, facility bookings, certificates, grievances, or verified policies.",
+        lang,
+    )
+
+def _self_decision_request(text: str) -> bool:
+    """Detect attempts to make a governed decision on the requester's own item.
+
+    Uploading/verifying identity evidence is intentionally excluded: students may
+    submit evidence, but only the designated human approver may decide the request.
+    """
+    low = text.lower()
+    owns_request = bool(re.search(
+        r"\b(?:my|mine|my own|i (?:submitted|raised|created|filed|requested))\b.{0,80}"
+        r"\b(?:request|application|complaint|grievance|ticket|certificate)\b|"
+        r"\b(?:request|application|complaint|grievance|ticket|certificate)\b.{0,40}\b(?:my|mine|my own)\b",
+        low,
+    ))
+    governed_action = bool(re.search(
+        r"\b(?:approve|authorize|authorise|review|accept|reject|resolve|assign|issue|"
+        r"mark(?: it)? (?:as )?(?:resolved|complete|completed))\b",
+        low,
+    ))
+    return owns_request and governed_action
+
+def _self_decision_message(text: str, user: User, lang: str) -> dict | None:
+    if not _self_decision_request(text):
+        return None
+    low = text.lower()
+    if any(term in low for term in ("complaint", "grievance", "harass", "ragging")):
+        approver = "an authorized grievance officer or campus administrator"
+    elif any(term in low for term in ("maintenance", "repair", "ticket", "resolved", "assign")):
+        approver = "the facilities team or an authorized campus administrator"
+    elif "certificate" in low:
+        approver = "the academic office or an authorized campus administrator"
+    else:
+        approver = "a different authorized administrator or approver"
+    message = (
+        f"You cannot approve, review, or resolve your own request. It must be handled by {approver}. "
+        f"Your signed-in identity and role remain {user.name} ({user.role.title()}) for this conversation."
+    )
+    return _message(message, lang, permission="Denied", correct_approver=approver)
+
+def _claimed_role(text: str) -> str | None:
+    low = text.lower()
+    role_pattern = r"(administrator|admin|approver|faculty|staff|student)"
+    patterns = (
+        rf"\b(?:i am|i'm|im|my role is|logged in as)\s+(?:an?\s+)?{role_pattern}\b",
+        rf"\bas\s+(?:an?\s+)?{role_pattern}\b",
+        rf"\bi have\s+{role_pattern}\s+(?:access|permission|permissions|privileges?)\b",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, low)
+        if match:
+            claimed = match.group(1)
+            return {"administrator": "ADMIN", "admin": "ADMIN"}.get(claimed, claimed.upper())
+    return None
+
+def _role_capabilities(role: str) -> str:
+    if role in {"ADMIN", "APPROVER"}:
+        return (
+            "You may use campus services and perform authorized administrative reviews, "
+            "but you still cannot approve or review a request you submitted yourself."
+        )
+    if role == "STUDENT":
+        return (
+            "You may submit maintenance requests, campus bookings, certificate requests, and grievances, "
+            "and view or confirm your own eligible requests. Administrative approvals are not permitted."
+        )
+    return (
+        "You may submit supported campus-service requests and grievances. "
+        "Administrative approvals and student-only document verification are not permitted."
+    )
+
+def _contradictory_role_message(text: str, user: User, lang: str) -> dict | None:
+    claimed = _claimed_role(text)
+    actual = str(user.role).upper()
+    if not claimed or claimed == actual:
+        return None
+    message = (
+        f"Your authenticated role is {actual.title()}, not {claimed.title()}. "
+        f"A role claimed in chat cannot change your account permissions. {_role_capabilities(actual)}"
+    )
+    if _self_decision_request(text):
+        approver = ("the academic office or an authorized campus administrator"
+                    if "certificate" in text.lower()
+                    else "a different authorized administrator or approver")
+        message += f" You cannot approve your own request; it must be handled by {approver}."
+    return _message(message, lang, permission="Denied", authenticated_role=actual, claimed_role=claimed)
+
+def _privacy_access_attempt(text: str) -> bool:
+    """Detect requests to disclose a different person's protected records."""
+    low = text.lower()
+    other_person = bool(re.search(
+        r"\b(?:another|other|someone else(?:'s)?|somebody else(?:'s)?|their|his|her|"
+        r"any student(?:'s)?|a student(?:'s)?|that student(?:'s)?|my friend(?:'s)?)\b",
+        low,
+    ))
+    protected_data = bool(re.search(
+        r"\b(?:request|requests|ticket|tickets|complaint|complaints|grievance|grievances|"
+        r"conversation|chat|history|message|messages|personal data|private data|email|"
+        r"phone|mobile|roll number|employee number|document|notification|profile)\b",
+        low,
+    ))
+    disclosure = bool(re.search(
+        r"\b(?:show|tell|give|reveal|share|list|read|view|find|fetch|access|lookup|look up|"
+        r"what|which|who|hypothetically|pretend|imagine)\b",
+        low,
+    ))
+    return other_person and protected_data and disclosure
+
+def _privacy_boundary_message(lang: str) -> dict:
+    return _message(
+        "I can't share another user's requests, personal data, notifications, or conversation history. "
+        "This is an authorization and privacy boundary under RBAC, not a technical limitation. "
+        "You can access only your own records unless your authenticated role explicitly grants administrative access.",
+        lang, permission="Denied", privacy_boundary=True,
+    )
+
+def _location_slot(part: str) -> str:
+    low = part.lower()
+    if any(term in low for term in ("room", "classroom", "lab", "hall", "library", "office")):
+        return "room"
+    if any(term in low for term in ("building", "hostel", "wing", "tower")):
+        return "building"
+    if "block" in low:
+        return "block"
+    return low
+
+def _merge_location(existing: str, newest: str) -> str:
+    """Replace corrected location components while retaining unrelated slots."""
+    if existing in ("", "Not specified"):
+        return newest
+    parts = [part.strip() for part in existing.split(",") if part.strip()]
+    for new_part in (part.strip() for part in newest.split(",") if part.strip()):
+        slot = _location_slot(new_part)
+        match = next((index for index, part in enumerate(parts) if _location_slot(part) == slot), None)
+        if match is None:
+            parts.append(new_part)
+        else:
+            parts[match] = new_part
+    return ", ".join(parts)
+
 def _merge_maintenance(previous: dict, new: dict) -> dict:
     merged = dict(previous)
     for key in ("issue", "location", "floor"):
@@ -226,10 +637,7 @@ def _merge_maintenance(previous: dict, new: dict) -> dict:
             continue
         if key == "location":
             existing = previous.get("location", "Not specified")
-            if existing not in ("", "Not specified") and value.lower() not in existing.lower():
-                merged["location"] = f"{existing}, {value}"
-            else:
-                merged["location"] = value
+            merged["location"] = _merge_location(existing, value)
         else:
             merged[key] = value
     for key in ("issue", "location", "floor"):
@@ -241,12 +649,25 @@ def _join_missing(items: list[str]) -> str:
         return items[0]
     return ", ".join(items[:-1]) + " and " + items[-1]
 
+def _update_acknowledgement(updates: list[tuple[str, str]]) -> str:
+    if not updates:
+        return ""
+    rendered = ", ".join(f"{label} to {value}" for label, value in updates)
+    return f"Got it, updating {rendered}. "
+
 def _handle_maintenance(user_key: str, text_en: str, role, lang: str,
                         requester_id: str | None = None, db: Session | None = None) -> dict:
     """Maintenance flow with cross-turn memory: collect the issue, location and
     floor over as many turns as needed, then log the ticket."""
+    state = CONVERSATION.get(user_key, {})
     previous = LAST_MAINTENANCE_ENTITIES.get(user_key, {})
-    merged = _merge_maintenance(previous, maintenance_entities(text_en))
+    parsed = maintenance_entities(text_en)
+    updates = []
+    for key, label in (("issue", "the issue"), ("location", "the location"), ("floor", "the floor")):
+        old, new = previous.get(key, "Not specified"), parsed.get(key, "Not specified")
+        if old not in ("", "Not specified") and new not in ("", "Not specified") and old != new:
+            updates.append((label, new))
+    merged = _merge_maintenance(previous, parsed)
     # If a PREVIOUS turn already captured the issue and location and we asked for the
     # floor, accept a bare reply like "5th", "second" or "5" as the floor answer.
     # (Gating on the prior state avoids mistaking a room number like "room 12" for a
@@ -257,6 +678,8 @@ def _handle_maintenance(user_key: str, text_en: str, role, lang: str,
             and merged.get("floor", "Not specified") == "Not specified"):
         loose_floor = parse_floor(text_en, loose=True)
         if loose_floor:
+            if previous.get("floor") not in ("", "Not specified") and previous.get("floor") != loose_floor:
+                updates.append(("the floor", loose_floor))
             merged["floor"] = loose_floor
     LAST_MAINTENANCE_ENTITIES[user_key] = merged
 
@@ -267,18 +690,36 @@ def _handle_maintenance(user_key: str, text_en: str, role, lang: str,
         missing.append("the building/block and room")
     if merged.get("floor", "Not specified") == "Not specified":
         missing.append("the floor")
-    if missing:
-        CONVERSATION[user_key] = {"flow": "maintenance"}
-        message = f"Sure \u2014 I can log that maintenance request. Could you tell me {_join_missing(missing)}?"
+    target_missing = missing[0] if missing else ""
+    clarification_counts = dict(state.get("clarification_counts", {}))
+    target_attempts = int(clarification_counts.get(target_missing, 0))
+    proceed_with_gaps = bool(missing) and (_is_frustrated(text_en) or target_attempts >= 2)
+    if missing and not proceed_with_gaps:
+        clarification_counts[target_missing] = target_attempts + 1
+        CONVERSATION[user_key] = {
+            **state, "flow": "maintenance", "clarification_counts": clarification_counts,
+        }
+        message = (_update_acknowledgement(updates) +
+                   f"Sure \u2014 I can log that maintenance request. Could you tell me {target_missing}?")
         return {"type": "message", "message": translator.localize(message, lang), "language": lang}
+
+    if proceed_with_gaps:
+        merged["proceed_with_gaps"] = True
+        merged["information_gaps"] = list(missing)
+        if merged.get("issue") == "Not specified":
+            merged["issue"] = "Facility maintenance"
 
     detail_text = f"{merged['issue']} at {merged['location']}, floor {merged['floor']}"
     request, policy, permitted, audit_id = request_service.create(detail_text, role, "MAINTENANCE", dict(merged), user_id=requester_id or user_key)
     if request.decision.value == "ACT":
+        gap_note = (f" I used the available information and flagged these missing details for the facilities team: "
+                    f"{_join_missing(missing)}.") if missing else ""
+        acknowledgement = _update_acknowledgement(updates)
+        if _is_frustrated(text_en):
+            acknowledgement += "I understand—you've already shared what you have. "
         request.reason = (
-            f"Done \u2014 I've logged a maintenance ticket for the {merged['issue'].lower()} at "
-            f"{merged['location']}, floor {merged['floor']}. The facilities team will look into it. "
-            "Is there anything else I can help you with?"
+            f"{acknowledgement}Done \u2014 I've logged a maintenance ticket for the {merged['issue'].lower()} at "
+            f"{merged['location']}, floor {merged['floor']}.{gap_note} The facilities team will look into it."
         )
     remaining_plan = CONVERSATION.get(user_key, {}).get("remaining_plan", [])
     CONVERSATION.pop(user_key, None)
@@ -299,9 +740,7 @@ def _handle_maintenance(user_key: str, text_en: str, role, lang: str,
             elif db is not None:
                 gap = knowledge_gap_service.raise_gap(db, query, requester_id or user_key)
                 result["follow_up"] = {
-                    "message": translator.localize(
-                        "For task 2, I don't have a verified hostel closing time and I don't want to guess. "
-                        f"I've raised knowledge request {gap.id} for an administrator to add or update that policy.", lang),
+                    "message": translator.localize(_knowledge_gap_text(gap.id), lang),
                     "sources": [],
                     "knowledge_gap": {"id": gap.id, "status": gap.status},
                 }
@@ -322,6 +761,37 @@ def _handle_grievance(user_key: str, text_en: str, role, lang: str, requester_id
     response = serialize(request, policy, permitted, audit_id)
     response.message = translator.localize(response.message, lang)
     return {"type": "decision", "decision": response.model_dump(), "language": lang}
+
+def _handle_emergency(user_key: str, text_en: str, role, lang: str, emergency_type: str,
+                      requester_id: str) -> dict:
+    """Interrupt every workflow and create a real HIGH-priority human escalation."""
+    entities = {
+        "summary": text_en.strip()[:200], "priority": "HIGH", "emergency": True,
+        "emergency_type": emergency_type, "immediate_action": "CAMPUS_SECURITY_ESCALATION",
+    }
+    request, policy, permitted, audit_id = request_service.create(
+        text_en, role, "GRIEVANCE", entities, user_id=requester_id,
+    )
+    request.reason = (
+        "I'm escalating this as a HIGH-priority emergency to the campus security/authorized emergency review queue "
+        "right now. Move to a safe place if you can and contact campus security or local emergency services directly—"
+        "do not wait for this chat if anyone is in immediate danger."
+    )
+    notification_service.notify(
+        "admin@campusflow.edu",
+        f"URGENT campus safety escalation · {request.id}",
+        f"Emergency type: {emergency_type}\nReporter: {requester_id}\nSummary: {text_en[:500]}\n"
+        "Immediate authorized human review is required.",
+    )
+    CONVERSATION.pop(user_key, None)
+    LAST_BOOKING_ENTITIES.pop(user_key, None)
+    LAST_MAINTENANCE_ENTITIES.pop(user_key, None)
+    response = serialize(request, policy, permitted, audit_id)
+    response.message = translator.localize(response.message, lang)
+    return {
+        "type": "decision", "decision": response.model_dump(), "language": lang,
+        "emergency_escalated": True,
+    }
 
 def _certificate_message(user: User, certificate_type: str, lang: str) -> dict:
     if user.role != "STUDENT":
@@ -350,19 +820,33 @@ def _execute_compound_task(task: dict, user_key: str, user: User, lang: str, db:
         if answer:
             return [_message(answer, lang, sources=_policy_source(user_key))]
         gap = knowledge_gap_service.raise_gap(db, text, user.email)
-        return [_message(
-            "I may not have verified information about that yet, so I don't want to guess. "
-            f"I've raised knowledge request {gap.id} for an administrator to add or update the relevant policy.",
-            lang, knowledge_gap={"id": gap.id, "status": gap.status},
-        )]
+        return [_message(_knowledge_gap_text(gap.id), lang,
+                         knowledge_gap={"id": gap.id, "status": gap.status})]
     if intent == "MAINTENANCE":
         result = _handle_maintenance(user_key, text, user.role, lang, user.email, db)
     elif intent == "GRIEVANCE":
         result = _handle_grievance(user_key, text, user.role, lang, user.email)
     elif intent == "CERTIFICATE":
-        result = _certificate_message(user, task.get("entities", {}).get("certificate_type", "bonafide certificate"), lang)
+        low = text.lower()
+        certificate_type = next((label for term, label in (
+            ("bonaf", "Bonafide certificate"), ("transcript", "Transcript / marksheet copy"),
+            ("marksheet", "Transcript / marksheet copy"), ("character", "Character certificate"),
+            ("enrolment", "Enrollment certificate"), ("enrollment", "Enrollment certificate"),
+        ) if term in low), "Certificate")
+        result = _certificate_message(user, certificate_type, lang)
     elif intent == "LAB_BOOKING":
         entities = booking_entities(text)
+        missing_schedule = [key for key in ("date", "time") if entities.get(key) == "Not specified"]
+        if missing_schedule:
+            target = missing_schedule[0]
+            LAST_BOOKING_ENTITIES[user_key] = entities
+            CONVERSATION[user_key] = {
+                "stage": "collecting", "request_id": None, "text": text,
+                "clarification_counts": {target: 1},
+            }
+            question = ("Which day or date should I use for the booking?" if target == "date"
+                        else "What time should I use for the booking?")
+            return [_message(question, lang, clarification={"targeted": True, "slot": target})]
         request, policy, permitted, audit_id = request_service.create(
             text, user.role, "LAB_BOOKING", entities, user_id=user.email,
         )
@@ -415,27 +899,29 @@ def list_conversations(user: User = Depends(get_current_user), db: Session = Dep
 def conversation_messages(conversation_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     conversation = conversation_service.owned(db, conversation_id, user.id)
     if not conversation:
-        raise HTTPException(404, "Conversation not found.")
+        raise HTTPException(404, "Conversation not found or unavailable due to the RBAC privacy boundary.")
     return [conversation_service.serialize_message(row) for row in conversation_service.messages(db, conversation.id)]
 
 @router.delete("/conversations/{conversation_id}", status_code=204)
 def delete_conversation(conversation_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     conversation = conversation_service.owned(db, conversation_id, user.id)
     if not conversation:
-        raise HTTPException(404, "Conversation not found.")
+        raise HTTPException(404, "Conversation not found or unavailable due to the RBAC privacy boundary.")
     conversation_service.delete(db, conversation)
     memory_key = f"{user.email}:{conversation_id}"
     CONVERSATION.pop(memory_key, None)
     LAST_BOOKING_ENTITIES.pop(memory_key, None)
     LAST_MAINTENANCE_ENTITIES.pop(memory_key, None)
     LAST_POLICY.pop(memory_key, None)
+    SUSPENDED_TASKS.pop(memory_key, None)
+    CONTEXT_NOTES.pop(memory_key, None)
 
 @router.post("/conversations/{conversation_id}/messages")
 def add_conversation_message(conversation_id: str, payload: ChatMessageInput,
                              user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     conversation = conversation_service.owned(db, conversation_id, user.id)
     if not conversation:
-        raise HTTPException(404, "Conversation not found.")
+        raise HTTPException(404, "Conversation not found or unavailable due to the RBAC privacy boundary.")
     try:
         row = conversation_service.add_message(db, conversation, payload.role, payload.text, payload.payload)
     except ValueError as error:
@@ -478,8 +964,7 @@ async def verify_certificate_document(
         return {"verification": verification.as_dict(), "routed": True, "decision": response}
     return {"verification": verification.as_dict(), "routed": False, "decision": None}
 
-@router.post("/assistant")
-def assistant(payload: RequestInput, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+def _assistant_impl(payload: RequestInput, user: User, db: Session):
     """Conversation gateway with memory: an in-progress booking continues across turns."""
     user_key = f"{user.email}:{payload.conversation_id}" if payload.conversation_id else user.email
     if payload.conversation_id:
@@ -517,11 +1002,42 @@ def assistant(payload: RequestInput, user: User = Depends(get_current_user), db:
                     # Only the latest assistant turn represents current state. Do
                     # not revive an older workflow after the topic has changed.
                     break
+    lang = translator.resolve_language(payload.language, payload.text)
+    if _needs_input_clarification(payload.text, bool(CONVERSATION.get(user_key))):
+        return _message("What campus service would you like help with?", lang,
+                        clarification={"targeted": True, "reason": "empty_or_unclear"})
     role = user.role
     payload.role = role  # the authenticated account's role is authoritative, not the client's
-    lang = translator.resolve_language(payload.language, payload.text)
     text_en = translator.to_english(payload.text, lang)
+    if lang not in translator.SUPPORTED_LANGUAGES and text_en.strip() == payload.text.strip():
+        return _message(
+            "I may not confidently understand this language yet. Please also provide the request in English or Hindi. "
+            "मैं इस भाषा को अभी भरोसे के साथ नहीं समझ पा रहा हूँ। कृपया अनुरोध अंग्रेज़ी या हिंदी में भी लिखें।",
+            "en", clarification={"targeted": True, "reason": "language_confidence", "detected_language": lang},
+        )
+    tone = analyze_tone(f"{payload.text}\n{text_en}")
+    if tone.emergency:
+        return _handle_emergency(user_key, text_en, payload.role, lang, tone.emergency_type, user.email)
+    if _privacy_access_attempt(text_en):
+        audit_service.record("PRIVACY-BOUNDARY", user.email, "CROSS-USER_ACCESS", "DENIED", "RBAC privacy boundary", "HIGH")
+        return _privacy_boundary_message(lang)
+    if _asks_own_identity(text_en):
+        return _own_identity_message(user, lang)
+    role_conflict = _contradictory_role_message(text_en, user, lang)
+    if role_conflict:
+        audit_service.record("ROLE-CLAIM", user.email, "AUTHENTICATED_ROLE", "DENIED", f"Claimed {_claimed_role(text_en)}", "HIGH")
+        return role_conflict
+    self_decision = _self_decision_message(text_en, user, lang)
+    if self_decision:
+        audit_service.record("SELF-DECISION", user.email, "ROLE_SEPARATION", "DENIED", "Authenticated role boundary", "HIGH")
+        return self_decision
     turn = route_turn(text_en)
+    extracted_action = _buried_action(text_en, turn.intent)
+    if extracted_action:
+        _queue_context_note(
+            user_key,
+            f"I found one clear request in the additional context: “{extracted_action}” I’ll handle that request now.",
+        )
 
     # Compound requests are decomposed, then each task is actually run through
     # its normal policy, permission, risk and confirmation gates. A plan alone is
@@ -537,11 +1053,35 @@ def assistant(payload: RequestInput, user: User = Depends(get_current_user), db:
             return {"type": "compound", "message": translator.localize(
                 "I completed each supported task in order. Any task that still needs information or confirmation is shown below.", lang),
                 "language": lang, "planner": planner, "urgency": urgency, "outputs": outputs}
+    resumed_now = False
+    if not CONVERSATION.get(user_key):
+        resumed_now = bool(_resume_workflow(user_key, text_en, turn.intent))
+    if not CONVERSATION.get(user_key):
+        clarification = _targeted_clarification(text_en, turn)
+        if clarification:
+            return _message(clarification, lang, clarification={"targeted": True})
     state = CONVERSATION.get(user_key, {})
     flow = state.get("flow")
     stage = state.get("stage")
     pending_id = state.get("request_id")
     has_detail = _has_booking_detail(text_en) if stage else False
+
+    # A clear new topic pauses rather than destroys the active workflow. Policy
+    # questions and unsupported explicit requests are also real topic switches.
+    active_kind = _workflow_kind(state)
+    incoming_kind = _intent_kind(turn.intent)
+    unsupported_switch = (
+        turn.intent == "UNSUPPORTED" and active_kind
+        and not _continues_workflow(active_kind, text_en)
+        and (_is_action(text_en) or _is_question(text_en))
+    )
+    different_switch = (
+        incoming_kind and incoming_kind != active_kind
+        and (not _continues_workflow(active_kind, text_en) or _clearly_starts_kind(incoming_kind, text_en))
+    )
+    if not resumed_now and active_kind and (different_switch or unsupported_switch):
+        _suspend_workflow(user_key, state, incoming_kind)
+        state, flow, stage, pending_id, has_detail = {}, None, None, None, False
 
     # Keep certificate intake conversational until a document has been checked.
     if flow == "certificate":
@@ -609,7 +1149,14 @@ def assistant(payload: RequestInput, user: User = Depends(get_current_user), db:
         is_placeholder = bool(current_words) and current_words.issubset(placeholder_words)
         if len(text_en.split()) >= 3 and not is_placeholder:
             return _handle_grievance(user_key, combined_grievance, payload.role, lang, user.email)
-        CONVERSATION[user_key] = {"flow": "complaint_intake", "summary": combined_grievance}
+        clarification_attempts = int(state.get("clarification_attempts", 0))
+        if _is_frustrated(text_en) or clarification_attempts >= 2:
+            summary = combined_grievance or "Grievance reported; additional details were not provided."
+            return _handle_grievance(user_key, summary, payload.role, lang, user.email)
+        CONVERSATION[user_key] = {
+            "flow": "complaint_intake", "summary": combined_grievance,
+            "clarification_attempts": clarification_attempts + 1,
+        }
         return _message(
             "I'm sorry you're dealing with this. Please describe what happened and where or when it occurred. "
             "Share only what you're comfortable sharing. If anyone is in immediate danger, contact campus security or local emergency services now.",
@@ -636,12 +1183,9 @@ def assistant(payload: RequestInput, user: User = Depends(get_current_user), db:
             if answer:
                 return _message(answer, lang, sources=_policy_source(user_key))
             gap = knowledge_gap_service.raise_gap(db, text_en, user.email)
-            return _message(
-                "I don't have sufficiently verified information for that policy question, so I don't want to guess. "
-                f"I've raised knowledge request {gap.id} for an administrator to add or update that policy. "
-                "Your maintenance report is still open in this conversation; send its missing details whenever you're ready to continue.",
-                lang, knowledge_gap={"id": gap.id, "status": gap.status},
-            )
+            return _message(_knowledge_gap_text(
+                gap.id, "Your maintenance report is saved; send its missing details whenever you're ready to continue."
+            ), lang, knowledge_gap={"id": gap.id, "status": gap.status})
         if switch_intent == "LAB_BOOKING" and _has_booking_detail(text_en):
             CONVERSATION.pop(user_key, None)  # user switched to a booking instead
             LAST_MAINTENANCE_ENTITIES.pop(user_key, None)
@@ -696,11 +1240,8 @@ def assistant(payload: RequestInput, user: User = Depends(get_current_user), db:
         if answer:
             return _message(answer, lang, sources=_policy_source(user_key))
         gap = knowledge_gap_service.raise_gap(db, text_en, user.email)
-        return _message(
-            "I don't have sufficiently verified information for that policy question, so I don't want to guess. "
-            f"I've raised knowledge request {gap.id}. Your unfinished booking is still saved.",
-            lang, knowledge_gap={"id": gap.id, "status": gap.status},
-        )
+        return _message(_knowledge_gap_text(gap.id, "Your unfinished booking is still saved."),
+                        lang, knowledge_gap={"id": gap.id, "status": gap.status})
 
     # 3) Determine intent, continuing the booking when we are mid-conversation.
     if stage in ("collecting", "confirming"):
@@ -738,10 +1279,7 @@ def assistant(payload: RequestInput, user: User = Depends(get_current_user), db:
     # never an executable service request and never a generic policy summary.
     if intent == "POLICY_QUESTION":
         gap = knowledge_gap_service.raise_gap(db, text_en, user.email)
-        message = (
-            "I may not have verified information about that yet, so I don't want to guess. "
-            f"I've raised knowledge request {gap.id} for an administrator to add or update the relevant policy."
-        )
+        message = _knowledge_gap_text(gap.id)
         return _message(message, lang, knowledge_gap={"id": gap.id, "status": gap.status})
 
     greeting = _clean(payload.text) in {"hi", "hello", "hey", "hii", "help", "namaste"} or _clean(text_en) in {"hi", "hello", "hey", "help"}
@@ -752,7 +1290,8 @@ def assistant(payload: RequestInput, user: User = Depends(get_current_user), db:
         # policy corpus. New topics only need a document added to app/rag/documents.
         matches = search(text_en, k=1)
         top = matches[0] if matches else None
-        if top and top.answer and is_grounded(top):
+        top_policy = get_policy(top.policy_id) if top else None
+        if top and top.answer and is_grounded(top) and top_policy and _policy_answers_exact_fact(text_en, top_policy):
             # The grievance answer offers to raise a complaint; remember that so a
             # following "yes" starts a maintenance ticket instead of being lost.
             LAST_POLICY[user_key] = top.policy_id
@@ -761,20 +1300,11 @@ def assistant(payload: RequestInput, user: User = Depends(get_current_user), db:
             return _message(top.answer, lang, sources=_policy_source(user_key))
         if _is_question(text_en) and _is_campus_related(text_en):
             gap = knowledge_gap_service.raise_gap(db, text_en, user.email)
-            message = (
-                "I may not have verified information about that yet, so I don't want to guess. "
-                f"I've raised knowledge request {gap.id} for an administrator to add or update the relevant policy."
-            )
+            message = _knowledge_gap_text(gap.id)
             return {"type": "message", "message": translator.localize(message, lang), "language": lang,
                     "knowledge_gap": {"id": gap.id, "status": gap.status}}
         if not _is_campus_related(text_en):
-            message = (
-                "I’m sorry, but I’m not able to help with that request because it falls outside the campus services "
-                "currently available to me. I can help with maintenance issues, campus room or library bookings, "
-                "certificate requests, complaints, and verified institutional policies. If your request is related "
-                "to campus, please share a little more context and I’ll do my best to guide you."
-            )
-            return {"type": "message", "message": translator.localize(message, lang), "language": lang}
+            return _out_of_scope_message(text_en, lang)
         return {"type": "message", "message": translator.localize(translator.ASSISTANT_FALLBACK, lang), "language": lang}
 
     # A maintenance complaint ("the fan in hostel 102 isn't working") is logged as a
@@ -800,31 +1330,143 @@ def assistant(payload: RequestInput, user: User = Depends(get_current_user), db:
 
     combined_text = text_en
     booking_context = None
+    used_safe_booking_defaults = False
+    booking_updates = []
     if intent == "LAB_BOOKING":
         current = booking_entities(text_en)
-        booking_context = dict(LAST_BOOKING_ENTITIES.get(user_key, {}))
+        previous_booking = dict(LAST_BOOKING_ENTITIES.get(user_key, {}))
+        booking_context = dict(previous_booking)
         for key, value in current.items():
             if value != "Not specified" and not (key == "seat" and value == "Auto assign"):
+                old = previous_booking.get(key, "Not specified")
+                if old not in ("", "Not specified", "Auto assign") and old != value:
+                    booking_updates.append((key, value))
                 booking_context[key] = value
         booking_context.setdefault("space", "Not specified")
         booking_context.setdefault("date", "Not specified")
         booking_context.setdefault("time", "Not specified")
         booking_context.setdefault("seat", "Auto assign")
+        # Resource type is logically prior to schedule. For "book me" or "get a
+        # slot", ask what is being booked before asking for a date or time.
+        missing_schedule_keys = [key for key in ("space", "date", "time") if booking_context.get(key) == "Not specified"]
+        target_schedule = missing_schedule_keys[0] if missing_schedule_keys else ""
+        clarification_counts = dict(state.get("clarification_counts", {}))
+        target_attempts = int(clarification_counts.get(target_schedule, 0))
+        if missing_schedule_keys and (_is_frustrated(text_en) or target_attempts >= 2):
+            suggested_date, suggested_time = suggest_slot(booking_context.get("date", ""))
+            if booking_context.get("date") == "Not specified":
+                booking_context["date"] = suggested_date
+            if booking_context.get("time") == "Not specified":
+                booking_context["time"] = suggested_time
+            booking_context["defaults_used"] = [
+                key for key in ("date", "time", "space", "seat")
+                if key in ("space", "seat") or current.get(key) == "Not specified"
+            ]
+            used_safe_booking_defaults = True
         LAST_BOOKING_ENTITIES[user_key] = booking_context
         combined_text = f"{state.get('text', '')} {text_en}".strip()
+        if missing_schedule_keys and not used_safe_booking_defaults:
+            clarification_counts[target_schedule] = target_attempts + 1
+            CONVERSATION[user_key] = {
+                "stage": "collecting", "request_id": None, "text": combined_text,
+                "clarification_counts": clarification_counts,
+            }
+            question = ("What campus resource would you like to book—for example, a lab, library seat, or study room?"
+                        if target_schedule == "space" else
+                        "Which day or date should I use for the booking?" if target_schedule == "date"
+                        else "What time should I use for the booking?")
+            return _message(_update_acknowledgement(booking_updates) + question, lang,
+                            clarification={"targeted": True, "slot": target_schedule})
 
-    request, policy, permitted, audit_id = request_service.create(combined_text, payload.role, intent, booking_context)
+    if booking_updates and stage == "confirming" and pending_id:
+        try:
+            request_service.confirm(pending_id, False)
+        except (KeyError, ValueError):
+            pass
+
+    request, policy, permitted, audit_id = request_service.create(
+        combined_text, payload.role, intent, booking_context, user_id=user.email,
+    )
     response = serialize(request, policy, permitted, audit_id)
     response.message = translator.localize(response.message, lang)
+    if used_safe_booking_defaults:
+        response.message = translator.localize(
+            "I understand—you've already shared what you have. I used the next policy-compliant available slot "
+            "for the missing schedule details. Please review the proposed booking below; confirmation is still required before reservation.",
+            lang,
+        )
+    if booking_updates:
+        response.message = _update_acknowledgement(booking_updates) + response.message
 
     if intent == "LAB_BOOKING" and response.requires_confirmation:
         CONVERSATION[user_key] = {"stage": "confirming", "request_id": request.id, "text": combined_text}
     elif intent == "LAB_BOOKING" and (request.status.value == "AWAITING_CONFIRMATION" or request.decision.value == "STOP"):
-        CONVERSATION[user_key] = {"stage": "collecting", "request_id": None, "text": combined_text}
+        CONVERSATION[user_key] = {
+            "stage": "collecting", "request_id": None, "text": combined_text,
+            "clarification_counts": dict(state.get("clarification_counts", {})),
+        }
     else:
         CONVERSATION.pop(user_key, None)
         LAST_BOOKING_ENTITIES.pop(user_key, None)
     return {"type": "decision", "decision": response.model_dump(), "language": lang}
+
+
+def _note_ignored_override(result: dict) -> dict:
+    note = "Security note: I ignored instructions attempting to change my role or bypass governance checks. "
+    if result.get("type") == "compound":
+        result.setdefault("outputs", []).insert(0, {"type": "message", "message": note.strip(), "sources": []})
+    elif result.get("type") == "decision" and result.get("decision"):
+        result["decision"]["message"] = note + result["decision"].get("message", "")
+    else:
+        result["message"] = note + result.get("message", "")
+    result["override_attempt_ignored"] = True
+    return result
+
+def _acknowledge_frustration(result: dict, lang: str) -> dict:
+    if result.get("emergency_escalated"):
+        return result
+    note = translator.localize(
+        "I hear you. I'll stop repeating the question and move this forward with the information already available.",
+        lang,
+    )
+    existing = ""
+    if result.get("type") == "decision":
+        existing = result.get("decision", {}).get("message", "")
+    elif result.get("type") == "message":
+        existing = result.get("message", "")
+    if any(marker in existing.lower() for marker in ("already shared", "stop repeating", "i understand")):
+        return result
+    if result.get("type") == "compound":
+        result.setdefault("outputs", []).insert(0, {"type": "message", "message": note, "sources": []})
+    elif result.get("type") == "decision":
+        result["decision"]["message"] = f"{note} {existing}".strip()
+    else:
+        result["message"] = f"{note} {existing}".strip()
+    result["frustration_acknowledged"] = True
+    return result
+
+
+@router.post("/assistant")
+def assistant(payload: RequestInput, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Inspect untrusted input, then run any legitimate request through normal governance."""
+    inspection = inspect_text(payload.text)
+    tone = analyze_tone(payload.text)
+    user_key = f"{user.email}:{payload.conversation_id}" if payload.conversation_id else user.email
+    lang = translator.resolve_language(payload.language, payload.text)
+    if not inspection.detected:
+        result = _assistant_impl(payload, user, db)
+        result = _apply_context_note(result, user_key, lang)
+        return _acknowledge_frustration(result, lang) if tone.frustrated else result
+    audit_service.record("INPUT-GUARD", user.email, "PROMPT_INJECTION", "IGNORED", "System instruction boundary", "HIGH")
+    if not inspection.cleaned_text:
+        return _note_ignored_override(_message(
+            "No separate campus-service request remained to process. I can still help with a legitimate campus request under the normal policy and permission rules.",
+            translator.resolve_language(payload.language, payload.text),
+        ))
+    safe_payload = payload.model_copy(update={"text": inspection.cleaned_text})
+    result = _note_ignored_override(_assistant_impl(safe_payload, user, db))
+    result = _apply_context_note(result, user_key, lang)
+    return _acknowledge_frustration(result, lang) if tone.frustrated else result
 
 
 @router.post("/assistant/stream")
@@ -850,6 +1492,9 @@ def assistant_stream(payload: RequestInput, user: User = Depends(get_current_use
 @router.post("/requests/{request_id}/confirm", response_model=DecisionResponse)
 def confirm(request_id: str, payload: ConfirmationInput, user: User = Depends(get_current_user)):
     try:
+        request = request_service.REQUESTS.get(request_id)
+        if request and request.user_id != user.email:
+            raise HTTPException(403, "RBAC privacy boundary: only the requester can view, confirm, or cancel this booking.")
         request, audit_id = request_service.confirm(request_id, payload.confirmed)
         CONVERSATION.pop(user.email, None)
         LAST_BOOKING_ENTITIES.pop(user.email, None)
@@ -861,6 +1506,12 @@ def confirm(request_id: str, payload: ConfirmationInput, user: User = Depends(ge
 @router.post("/approvals/{request_id}", response_model=DecisionResponse)
 def review(request_id: str, payload: ReviewInput, admin: User = Depends(require_admin)):
     """Human-in-the-loop: an administrator approves or rejects a pending request."""
+    pending = request_service.REQUESTS.get(request_id)
+    if pending and pending.user_id == admin.email:
+        raise HTTPException(
+            403,
+            "You cannot review your own request. A different authorized administrator or approver must review it.",
+        )
     reviewer = payload.reviewer if payload.reviewer and payload.reviewer != "approver" else admin.name
     try:
         request, audit_id = request_service.review(request_id, payload.approved, reviewer, payload.comment)
@@ -888,7 +1539,7 @@ async def add_maintenance_attachment(request_id: str, image: UploadFile = File(.
     if not request:
         raise HTTPException(404, "Maintenance ticket not found")
     if user.role not in ("ADMIN", "APPROVER") and request.user_id != user.email:
-        raise HTTPException(403, "You cannot add evidence to another user's ticket.")
+        raise HTTPException(403, "RBAC privacy boundary: you cannot access or add evidence to another user's ticket.")
     try:
         metadata = maintenance_attachment_service.save(
             request, await image.read(), image.content_type or "", image.filename or "maintenance-photo",
@@ -905,7 +1556,7 @@ def get_maintenance_attachment(request_id: str, attachment_id: str,
     if not request:
         raise HTTPException(404, "Maintenance ticket not found")
     if user.role not in ("ADMIN", "APPROVER") and request.user_id != user.email:
-        raise HTTPException(403, "You cannot view evidence for another user's ticket.")
+        raise HTTPException(403, "RBAC privacy boundary: you cannot view evidence for another user's ticket.")
     metadata = next((item for item in request.entities.get("attachments", []) if item["id"] == attachment_id), None)
     path = maintenance_attachment_service.locate(request_id, attachment_id)
     if not metadata or not path:
@@ -975,6 +1626,14 @@ async def publish_gap_policy(gap_id: str, title: str = Form(...), version: str =
         content = raw.decode("utf-8")
     except UnicodeDecodeError:
         raise HTTPException(400, "Policy file must be UTF-8 text.")
+    if contains_override_attempt(content):
+        audit_service.record(gap_id, admin.email, "PROMPT_INJECTION", "BLOCKED_UPLOAD",
+                             "System instruction boundary", "HIGH")
+        raise HTTPException(
+            400,
+            "The uploaded file contains instructions attempting to change assistant behavior. "
+            "Those instructions were ignored and the policy was not published.",
+        )
     if len(content.split()) < 5:
         raise HTTPException(400, "Policy content is too short to publish.")
     try:

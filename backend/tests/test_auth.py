@@ -1,29 +1,62 @@
 """Sign-up, login and admin enrolment-approval flows."""
 import uuid
+import re
 
 
-def _signup(client, role, password="secret123"):
+def _signup(client, role, password="secret123", verify=True):
     suffix = uuid.uuid4().hex[:8]
     email = f"{role.lower()}-{suffix}@campus.edu"
     resp = client.post("/api/v1/auth/signup", json={
         "name": f"Test {role.title()}", "roll_no": f"R-{suffix}", "email": email,
         "mobile": "9876543210", "role": role, "password": password,
     })
-    return email, resp
+    if not verify:
+        return email, resp
+    from app.services.notification_service import OUTBOX
+    body = next(item["body"] for item in OUTBOX if item["to"] == email and "verification code" in item["body"])
+    code = re.search(r"\b\d{6}\b", body).group(0)
+    return email, client.post("/api/v1/auth/verify-email", json={"email": email, "code": code})
 
 
 def test_student_self_enrols_and_is_logged_in(client):
     _, resp = _signup(client, "STUDENT")
     body = resp.json()
     assert resp.status_code == 200
-    assert body["pending"] is False
+    assert body["pending_approval"] is False
     assert body["access_token"]
     assert body["user"]["status"] == "ACTIVE"
 
 
+def test_signup_requires_email_verification_before_login(client):
+    email, signup = _signup(client, "STUDENT", verify=False)
+    body = signup.json()
+    assert body["verification_required"] is True
+    assert "access_token" not in body
+    login = client.post("/api/v1/auth/login", json={"email": email, "password": "secret123"})
+    assert login.status_code == 403
+    assert "verify your email" in login.json()["detail"].lower()
+
+
+def test_invalid_code_is_rejected_and_resend_invalidates_previous_code(client):
+    email, _ = _signup(client, "STUDENT", verify=False)
+    from app.services.notification_service import OUTBOX
+    first_body = next(item["body"] for item in OUTBOX if item["to"] == email and "verification code" in item["body"])
+    first_code = re.search(r"\b\d{6}\b", first_body).group(0)
+    bad = client.post("/api/v1/auth/verify-email", json={"email": email, "code": "999999" if first_code != "999999" else "888888"})
+    assert bad.status_code == 400
+    client.post("/api/v1/auth/resend-verification", json={"email": email})
+    latest_body = next(item["body"] for item in OUTBOX if item["to"] == email and "verification code" in item["body"])
+    latest_code = re.search(r"\b\d{6}\b", latest_body).group(0)
+    if latest_code != first_code:
+        assert client.post("/api/v1/auth/verify-email", json={"email": email, "code": first_code}).status_code == 400
+    verified = client.post("/api/v1/auth/verify-email", json={"email": email, "code": latest_code})
+    assert verified.status_code == 200
+    assert verified.json()["user"]["status"] == "ACTIVE"
+
+
 def test_faculty_signup_is_pending_and_cannot_login(client):
     email, resp = _signup(client, "FACULTY")
-    assert resp.json()["pending"] is True
+    assert resp.json()["pending_approval"] is True
     login = client.post("/api/v1/auth/login", json={"email": email, "password": "secret123"})
     assert login.status_code == 403
 
@@ -102,3 +135,33 @@ def test_admin_cannot_revoke_own_access(client, admin_headers):
     me = client.get("/api/v1/auth/me", headers=admin_headers).json()
     r = client.post(f"/api/v1/admin/users/{me['id']}/access", json={"active": False}, headers=admin_headers)
     assert r.status_code == 400
+
+
+def test_only_admin_can_delete_user_and_access_is_removed_immediately(client, admin_headers):
+    email, verified = _signup(client, "STUDENT")
+    user = verified.json()["user"]
+    user_headers = {"Authorization": f"Bearer {verified.json()['access_token']}"}
+    conversation_id = client.post("/api/v1/conversations", json={}, headers=user_headers).json()["id"]
+    request_id = client.post(
+        "/api/v1/requests", json={"text": "Classroom 305 AC is not working"}, headers=user_headers,
+    ).json()["request_id"]
+
+    denied = client.delete(f"/api/v1/admin/users/{user['id']}", headers=user_headers)
+    assert denied.status_code == 403
+    deleted = client.delete(f"/api/v1/admin/users/{user['id']}", headers=admin_headers)
+    assert deleted.status_code == 200
+    assert deleted.json()["deleted"] is True
+
+    assert client.get("/api/v1/auth/me", headers=user_headers).status_code == 401
+    assert all(row["id"] != user["id"] for row in client.get("/api/v1/admin/users", headers=admin_headers).json())
+    assert all(row["id"] != request_id for row in client.get("/api/v1/requests", headers=admin_headers).json())
+    from app.db import SessionLocal
+    from app.db_models import Conversation
+    with SessionLocal() as db:
+        assert db.get(Conversation, conversation_id) is None
+
+
+def test_admin_cannot_delete_self(client, admin_headers):
+    me = client.get("/api/v1/auth/me", headers=admin_headers).json()
+    response = client.delete(f"/api/v1/admin/users/{me['id']}", headers=admin_headers)
+    assert response.status_code == 400

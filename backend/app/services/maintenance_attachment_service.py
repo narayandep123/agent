@@ -50,3 +50,22 @@ def save(request, content: bytes, content_type: str, original_name: str) -> dict
 def locate(request_id: str, attachment_id: str) -> Path | None:
     path = _FILES.get((request_id, attachment_id))
     return path if path and path.is_file() else None
+
+
+def delete_for_request(request_id: str) -> int:
+    """Remove all stored evidence belonging to one deleted request."""
+    removed = 0
+    for key, path in list(_FILES.items()):
+        if key[0] != request_id:
+            continue
+        if path.is_file():
+            path.unlink()
+            removed += 1
+        _FILES.pop(key, None)
+    # Also cover files restored from disk after a process restart.
+    if UPLOAD_ROOT.is_dir():
+        for path in UPLOAD_ROOT.glob(f"{request_id}-IMG-*"):
+            if path.is_file():
+                path.unlink()
+                removed += 1
+    return removed

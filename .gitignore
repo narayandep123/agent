@@ -9,3 +9,4 @@ dist/
 *.log
 *.db
 backend/uploads/
+.DS_Store

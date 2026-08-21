@@ -22,6 +22,7 @@ const NAV_BY_ROLE={
 function Auth({onAuthed}){
   const[mode,setMode]=useState('signin');
   const[form,setForm]=useState({name:'',roll_no:'',email:'',mobile:'',role:'STUDENT',password:''});
+  const[code,setCode]=useState('');
   const[err,setErr]=useState('');const[note,setNote]=useState('');const[busy,setBusy]=useState(false);
   const set=(k)=>(e)=>setForm(f=>({...f,[k]:e.target.value}));
   async function submit(e){e.preventDefault();setErr('');setNote('');setBusy(true);
@@ -30,11 +31,16 @@ function Auth({onAuthed}){
         const r=await api('auth/login',{method:'POST',body:JSON.stringify({email:form.email,password:form.password})});
         if(!r.ok)throw new Error(await detail(r));
         const d=await r.json();setToken(d.access_token);onAuthed(d.user);
-      }else{
+      }else if(mode==='signup'){
         const r=await api('auth/signup',{method:'POST',body:JSON.stringify(form)});
         if(!r.ok)throw new Error(await detail(r));
         const d=await r.json();
-        if(d.pending){setMode('signin');setNote(d.message);setForm(f=>({...f,password:''}));}
+        setMode('verify');setNote(d.message);
+      }else{
+        const r=await api('auth/verify-email',{method:'POST',body:JSON.stringify({email:form.email,code})});
+        if(!r.ok)throw new Error(await detail(r));
+        const d=await r.json();
+        if(d.pending_approval){setMode('signin');setNote(d.message);setForm(f=>({...f,password:''}));setCode('');}
         else{setToken(d.access_token);onAuthed(d.user);}
       }
     }catch(ex){setErr(ex.message);}finally{setBusy(false);}
@@ -42,19 +48,21 @@ function Auth({onAuthed}){
   return <div className="auth-shell"><div className="auth-card">
     <div className="brand auth-brand"><Bot/><span>Campus<span>Flow</span></span></div>
     <p className="auth-tag">CONTROLLED-AUTONOMY INSTITUTIONAL AGENT</p>
-    <div className="auth-tabs"><button className={mode==='signin'?'on':''} onClick={()=>{setMode('signin');setErr('');}}>Sign in</button><button className={mode==='signup'?'on':''} onClick={()=>{setMode('signup');setErr('');}}>Sign up</button></div>
+    <div className="auth-tabs"><button className={mode==='signin'?'on':''} onClick={()=>{setMode('signin');setErr('');}}>Sign in</button><button className={mode==='signup'||mode==='verify'?'on':''} onClick={()=>{setMode('signup');setErr('');}}>Sign up</button></div>
     {note&&<p className="auth-note"><ShieldAlert size={15}/>{note}</p>}
     {err&&<p className="auth-error">{err}</p>}
     <form onSubmit={submit} className="auth-form">
       {mode==='signup'&&<><label>Full name<input value={form.name} onChange={set('name')} required placeholder="e.g. Mayank Kumar"/></label>
       <label>Roll / employee no.<input value={form.roll_no} onChange={set('roll_no')} placeholder="e.g. 2201289054"/></label></>}
-      <label>College email<input type="email" value={form.email} onChange={set('email')} required placeholder="you@college.edu"/></label>
+      {mode!=='verify'&&<label>College email<input type="email" value={form.email} onChange={set('email')} required placeholder="you@college.edu"/></label>}
       {mode==='signup'&&<label>Mobile number<input value={form.mobile} onChange={set('mobile')} required placeholder="10-digit mobile"/></label>}
       {mode==='signup'&&<label>Role<select value={form.role} onChange={set('role')}>{ROLES.map(([v,l])=><option key={v} value={v}>{l}</option>)}</select></label>}
-      <label>Password<input type="password" value={form.password} onChange={set('password')} required minLength={6} placeholder="At least 6 characters"/></label>
+      {mode!=='verify'&&<label>Password<input type="password" value={form.password} onChange={set('password')} required minLength={6} placeholder="At least 6 characters"/></label>}
+      {mode==='verify'&&<><p className="verify-copy">Enter the six-digit code sent to <b>{form.email}</b>.</p><label>Verification code<input className="code-input" value={code} onChange={e=>setCode(e.target.value.replace(/\D/g,'').slice(0,6))} required inputMode="numeric" pattern="[0-9]{6}" autoComplete="one-time-code" placeholder="000000"/></label></>}
       {mode==='signup'&&form.role!=='STUDENT'&&<p className="auth-hint">{`${ROLES.find(r=>r[0]===form.role)[1]} accounts require administrator approval before first sign-in.`}</p>}
-      <button className="auth-submit" disabled={busy}>{busy?'Please wait…':mode==='signin'?'Sign in':'Create account'}</button>
+      <button className="auth-submit" disabled={busy}>{busy?'Please wait…':mode==='signin'?'Sign in':mode==='verify'?'Verify email':'Create account'}</button>
     </form>
+    {mode==='verify'&&<button className="resend-code" disabled={busy} onClick={async()=>{setErr('');const r=await api('auth/resend-verification',{method:'POST',body:JSON.stringify({email:form.email})});setNote((await r.json()).message);}}>Resend code</button>}
     <p className="auth-foot">Demo admin · admin@campusflow.edu / admin123</p>
   </div></div>;
 }
@@ -116,7 +124,7 @@ function Approvals({requests,users,onReview,onReviewUser}){const items=requests.
   </section>;
 }
 
-function UserGrid({users,me,onReviewUser,onAccess}){return <section className="content-card"><span className="eyebrow">USER MANAGEMENT</span><h2>All accounts</h2>{users.length?<div className="table-wrap"><table><thead><tr><th>Name</th><th>Email</th><th>Role</th><th>Mobile</th><th>Status</th><th>Action</th></tr></thead><tbody>{users.map(u=><tr key={u.id}><td>{u.name}</td><td>{u.email}</td><td>{u.role[0]+u.role.slice(1).toLowerCase()}</td><td>{u.mobile||'—'}</td><td><span className={`tag-status ${u.status.toLowerCase()}`}>{u.status}</span></td><td className="rowactions">{u.id===me.id?<span className="you-tag">You</span>:u.status==='PENDING'?<><button className="approve" onClick={()=>onReviewUser(u.id,true,'')}><Check size={14}/>Approve</button><button className="reject" onClick={()=>onReviewUser(u.id,false,'')}>Reject</button></>:u.status==='ACTIVE'?<button className="reject" onClick={()=>onAccess(u.id,false)}>Revoke access</button>:<button className="approve" onClick={()=>onAccess(u.id,true)}><Check size={14}/>Restore</button>}</td></tr>)}</tbody></table></div>:<p className="empty">No accounts yet.</p>}</section>;}
+function UserGrid({users,me,onReviewUser,onAccess,onDelete}){return <section className="content-card"><span className="eyebrow">USER MANAGEMENT</span><h2>All accounts</h2>{users.length?<div className="table-wrap"><table><thead><tr><th>Name</th><th>Email</th><th>Role</th><th>Mobile</th><th>Status</th><th>Action</th></tr></thead><tbody>{users.map(u=><tr key={u.id}><td>{u.name}</td><td>{u.email}</td><td>{u.role[0]+u.role.slice(1).toLowerCase()}</td><td>{u.mobile||'—'}</td><td><span className={`tag-status ${u.status.toLowerCase()}`}>{u.status.replaceAll('_',' ')}</span></td><td className="rowactions">{u.id===me.id?<span className="you-tag">You</span>:<>{u.status==='PENDING'?<><button className="approve" onClick={()=>onReviewUser(u.id,true,'')}><Check size={14}/>Approve</button><button className="reject" onClick={()=>onReviewUser(u.id,false,'')}>Reject</button></>:u.status==='ACTIVE'?<button className="reject" onClick={()=>onAccess(u.id,false)}>Revoke access</button>:u.status!=='EMAIL_PENDING'&&<button className="approve" onClick={()=>onAccess(u.id,true)}><Check size={14}/>Restore</button>}<button className="delete-user" onClick={()=>onDelete(u)}><Trash2 size={14}/>Delete</button></>}</td></tr>)}</tbody></table></div>:<p className="empty">No accounts yet.</p>}</section>;}
 
 function AuditView({rows,chain}){return <section className="content-card"><div className="section-title"><div><span className="eyebrow">CAMPUSFLOW</span><h2>Audit trail</h2></div>{chain&&<span className={chain.valid?'chain ok':'chain bad'}><ShieldCheck size={14}/>{chain.valid?`Hash-chain verified · ${chain.count} events`:`Chain broken at ${chain.broken_at}`}</span>}</div>{rows.length?<div className="table-wrap"><table><thead><tr><th>Time</th><th>Request ID</th><th>Action</th><th>Policy</th><th>Risk</th><th>Result</th><th>Hash</th></tr></thead><tbody>{rows.map((r,i)=><tr key={r.id||i}><td>{new Date(r.timestamp).toLocaleString()}</td><td>{r.request_id}</td><td>{r.action}</td><td>{r.policy}</td><td>{r.risk}</td><td>{r.result}</td><td className="hash" title={r.hash}>{(r.hash||'').slice(0,10)}…</td></tr>)}</tbody></table></div>:<p className="empty">No records yet.</p>}</section>}
 
@@ -152,6 +160,7 @@ function App(){
   async function review(id,approved,comment){await api(`approvals/${id}`,{method:'POST',body:JSON.stringify({approved,comment})});load();}
   async function reviewUser(id,approved,comment){await api(`admin/users/${id}/decision`,{method:'POST',body:JSON.stringify({approved,comment})});load();}
   async function setAccess(id,active){await api(`admin/users/${id}/access`,{method:'POST',body:JSON.stringify({active})});load();}
+  async function deleteUser(target){if(!window.confirm(`Permanently delete ${target.name} (${target.email})? Their access, conversations, requests, and notifications will be removed.`))return;const r=await api(`admin/users/${target.id}`,{method:'DELETE'});if(!r.ok){alert(await detail(r));return;}load();}
   async function navigate(name){setPage(name);if(name==='Notifications'){const r=await api('notifications/read',{method:'POST',body:'{}'});if(r.ok){const rows=await r.json();setNotifs(Array.isArray(rows)?rows:[]);}}}
   function logout(){setToken('');setUser(null);setPage('Assistant');setRequests([]);setUsers([]);setAudit([]);setNotifs([]);}
 
@@ -171,7 +180,7 @@ function App(){
   else if(page==='Maintenance')view=<MaintenanceBoard rows={requests} reload={load}/>;
   else if(page==='Approvals')view=<Approvals requests={requests} users={users} onReview={review} onReviewUser={reviewUser}/>;
   else if(page==='Knowledge gaps')view=<KnowledgeGaps rows={gaps} reload={load}/>;
-  else if(page==='Users')view=<UserGrid users={users} me={user} onReviewUser={reviewUser} onAccess={setAccess}/>;
+  else if(page==='Users')view=<UserGrid users={users} me={user} onReviewUser={reviewUser} onAccess={setAccess} onDelete={deleteUser}/>;
   else if(page==='Notifications')view=<Notifications rows={notifs}/>;
   else if(page==='Policies')view=<Table title="Verified policies" rows={policies} cols={[['id','Policy ID'],['name','Policy'],['version','Version']]}/>;
   else if(page==='Audit')view=<AuditView rows={audit} chain={chain}/>;

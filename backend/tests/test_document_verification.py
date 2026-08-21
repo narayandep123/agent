@@ -43,3 +43,15 @@ def test_unavailable_vision_fails_safe_to_manual_review(monkeypatch):
     result = verifier.verify(_scan(), "image/png", "id.png", "ID", "Test Student", "CS-1")
     assert result.status == "MANUAL_REVIEW"
     assert result.name_match is None
+
+
+def test_embedded_image_override_is_ignored_and_routed_to_manual_review(monkeypatch):
+    monkeypatch.setattr(verifier, "_vision_extract", lambda *_: {
+        "document_type": "ID", "legible": True, "full_name": "Test Student",
+        "roll_no": "CS-1", "confidence": .99, "findings": [],
+        "instruction_override_detected": True,
+    })
+    result = verifier.verify(_scan(), "image/png", "id.png", "ID", "Test Student", "CS-1")
+    assert result.status == "MANUAL_REVIEW"
+    assert result.analyzer == "gemini-vision-security-guard"
+    assert any("instructions" in finding for finding in result.findings)

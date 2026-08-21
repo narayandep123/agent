@@ -22,6 +22,13 @@ ASSISTANT_GREETING = "Hello! I can help you report maintenance issues, book a la
 ASSISTANT_FALLBACK = "I’m here for campus services. Try describing a maintenance issue, lab/room booking, certificate request, or ask about an official policy."
 
 _DEVANAGARI = re.compile(r"[\u0900-\u097F]")
+_SCRIPT_LANGUAGES = (
+    (re.compile(r"[\u0980-\u09FF]"), "bn"),
+    (re.compile(r"[\u0B80-\u0BFF]"), "ta"),
+    (re.compile(r"[\u0C00-\u0C7F]"), "te"),
+    (re.compile(r"[\u0C80-\u0CFF]"), "kn"),
+    (re.compile(r"[\u0D00-\u0D7F]"), "ml"),
+)
 _HINGLISH_HINTS = ("kal", "aaj", "kaam nahi", "kharab", "chahiye", "karna", "banwana", "paani", "manzil", "kamra", "theek")
 
 # Offline glossary to help the deterministic interpreter understand Hinglish.
@@ -50,6 +57,18 @@ _LANGUAGE_NAME = {"hi": "Hindi", "hinglish": "Hindi written in the Latin script 
 
 # Curated translations for the finite set of static system messages.
 _PHRASES: dict[str, dict[str, str]] = {
+    "What campus service would you like help with?": {
+        "hi": "आप किस कैंपस सेवा में सहायता चाहते हैं?",
+        "hinglish": "Aapko kis campus service mein help chahiye?",
+    },
+    "I hear you. I'll stop repeating the question and move this forward with the information already available.": {
+        "hi": "मैं आपकी बात समझ रहा हूँ। अब वही सवाल नहीं दोहराऊँगा और उपलब्ध जानकारी के साथ इसे आगे बढ़ाता हूँ।",
+        "hinglish": "Main samajh raha hoon. Ab wahi sawaal repeat nahi karunga aur jo information hai usi ke saath aage badhta hoon.",
+    },
+    "I'm escalating this as a HIGH-priority emergency to the campus security/authorized emergency review queue right now. Move to a safe place if you can and contact campus security or local emergency services directly—do not wait for this chat if anyone is in immediate danger.": {
+        "hi": "मैं इसे अभी उच्च-प्राथमिकता आपातस्थिति के रूप में कैंपस सुरक्षा और अधिकृत आपात समीक्षा टीम को भेज रहा हूँ। यदि संभव हो तो सुरक्षित स्थान पर जाएँ और कैंपस सुरक्षा या स्थानीय आपात सेवा से सीधे संपर्क करें—यदि कोई तत्काल खतरे में है तो इस चैट की प्रतीक्षा न करें।",
+        "hinglish": "Main ise abhi HIGH-priority emergency ke roop me campus security aur authorized emergency review team ko escalate kar raha hoon. Agar mumkin ho to safe jagah jaiye aur campus security ya local emergency services ko seedha contact kijiye—immediate danger me is chat ka wait mat kijiye.",
+    },
     ASSISTANT_GREETING: {
         "hi": "नमस्ते! मैं रखरखाव की समस्या दर्ज करने, लैब या कमरा बुक करने, प्रमाणपत्र का अनुरोध करने, या किसी आधिकारिक नीति को समझाने में आपकी मदद कर सकता हूँ।",
         "hinglish": "Namaste! Main maintenance issue report karne, lab ya room book karne, certificate request karne, ya kisi official policy ko samjhane me aapki help kar sakta hoon.",
@@ -110,10 +129,13 @@ _PHRASES: dict[str, dict[str, str]] = {
 
 
 def resolve_language(requested: str | None, text: str) -> str:
-    if requested and requested.lower() in SUPPORTED_LANGUAGES:
+    if requested and requested.lower() not in {"", "auto"}:
         return requested.lower()
     if _DEVANAGARI.search(text):
         return "hi"
+    for script, language in _SCRIPT_LANGUAGES:
+        if script.search(text):
+            return language
     lowered = text.lower()
     if any(hint in lowered for hint in _HINGLISH_HINTS):
         return "hinglish"
@@ -159,7 +181,7 @@ def localize(message: str, language: str) -> str:
         return message
     llm = _llm_translate(
         message,
-        f"Translate the user's message to {_LANGUAGE_NAME[language]}. Keep IDs, numbers, times and dates unchanged. Return only the translation.",
+        f"Translate the user's message to {_LANGUAGE_NAME.get(language, language)}. Keep IDs, numbers, times and dates unchanged. Return only the translation.",
     )
     if llm:
         return llm

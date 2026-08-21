@@ -16,6 +16,15 @@ class LoginInput(BaseModel):
     password: str
 
 
+class EmailVerificationInput(BaseModel):
+    email: EmailStr
+    code: str = Field(min_length=6, max_length=6, pattern=r"^\d{6}$")
+
+
+class EmailResendInput(BaseModel):
+    email: EmailStr
+
+
 class UserOut(BaseModel):
     id: int
     name: str

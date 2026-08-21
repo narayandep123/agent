@@ -9,7 +9,7 @@ that only the regex extractor guarantees.
 from __future__ import annotations
 
 from app.agents import gemini_adapter
-from app.agents.interpreter import booking_entities, interpret
+from app.agents.interpreter import booking_entities, interpret, maintenance_entities
 
 _DEFAULT_ENTITIES = {
     "MAINTENANCE": {"location": "Not specified", "floor": "Not specified", "issue": "Facility maintenance"},
@@ -58,7 +58,19 @@ def propose(text: str) -> tuple[str, dict, str, str]:
         return intent, booking_entities(text), language, "gemini"
     if intent == det_intent:
         return intent, det_entities, language, "gemini"
-    return intent, _normalize(intent, llm.get("entities", {})), language, "gemini"
+    # Gemini may classify an ambiguous request, but it cannot supply facts. All
+    # action entities are derived from the user's text or explicitly marked as
+    # missing so the dialogue layer can ask one targeted question.
+    if intent == "MAINTENANCE":
+        return intent, maintenance_entities(text), language, "gemini"
+    if intent == "GRIEVANCE":
+        return intent, {"summary": text.strip()[:200]}, language, "gemini"
+    if intent == "CERTIFICATE":
+        certificate_type = "Bonafide certificate" if "bonaf" in text.lower() else "Certificate"
+        return intent, {"certificate_type": certificate_type}, language, "gemini"
+    if intent == "POLICY_QUESTION":
+        return intent, {"policy_topic": text.strip()[:200]}, language, "gemini"
+    return "UNSUPPORTED", {}, language, "guardrail"
 
 
 def propose_plan(text: str) -> tuple[list[dict], str, str]:
