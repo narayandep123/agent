@@ -112,7 +112,7 @@ def test_duplicate_roll_number_is_rejected_case_insensitively(client):
     assert client.post("/api/v1/auth/signup", json=first).status_code == 200
     duplicate = client.post("/api/v1/auth/signup", json=second)
     assert duplicate.status_code == 409
-    assert "roll / employee number" in duplicate.json()["detail"]
+    assert "SOA ID" in duplicate.json()["detail"]
 
 
 def test_admin_user_list_requires_admin(client, student_headers):

@@ -150,6 +150,16 @@ def _ground_known_params(task: ProposedTask, intent: str, text: str,
                          if key in allowed_keys and value not in (None, "", "Not specified", "Auto assign")})
     except Exception:
         pass
+    if intent == "POLICY_QUESTION" and "policy_topic" not in grounded:
+        topics = {
+            "bonafide": "bonafide certificate", "scholarship": "scholarship",
+            "hostel": "hostel", "curfew": "hostel curfew", "maintenance": "maintenance",
+            "library": "library", "ragging": "anti-ragging", "harassment": "harassment",
+            "exam": "examination", "transcript": "transcript/marksheet",
+        }
+        grounded_topic = next((topic for marker, topic in topics.items() if marker in low), "")
+        if grounded_topic:
+            grounded["policy_topic"] = grounded_topic
     return grounded
 
 
@@ -168,10 +178,10 @@ def _coerce(plan: AgentPlan, text: str = "", current_plan: list[dict] | None = N
             "GRIEVANCE": ("summary",),
             "POLICY_QUESTION": ("policy_topic",),
         }.get(intent, ())
-        missing_params = list(dict.fromkeys(
+        missing_params = [field for field in dict.fromkeys(
             [str(item)[:60] for item in task.missing_params]
             + [field for field in required if field not in known_params]
-        ))
+        ) if field not in known_params]
         tasks.append({
             "task_id": task.task_id, "intent": intent, "summary": task.summary.strip()[:240],
             "known_params": known_params, "entities": known_params,
@@ -212,7 +222,7 @@ def plan(text: str, current_plan: list[dict] | None = None) -> dict | None:
             )
         response = client.models.generate_content(
             model=os.getenv("GEMINI_MODEL", "gemini-3.6-flash"),
-            contents=text,
+            contents=contents,
             config=types.GenerateContentConfig(
                 system_instruction=_SYSTEM_PROMPT,
                 tools=[types.Tool(function_declarations=[declaration])],

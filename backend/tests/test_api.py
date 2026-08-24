@@ -365,6 +365,48 @@ def test_maintenance_photo_is_optional_validated_and_access_controlled(client, s
     assert "readable image" in invalid.json()["detail"]
 
 
+def test_certificate_supporting_document_is_visible_to_owner_and_admin_only(
+        client, student_headers, admin_headers, monkeypatch):
+    student = client.get("/api/v1/auth/me", headers=student_headers).json()
+    monkeypatch.setattr("app.services.document_verification_service._vision_extract", lambda *_: {
+        "document_type": "ID", "legible": True, "full_name": student["name"],
+        "soa_id": student["roll_no"], "confidence": .95, "findings": [],
+    })
+    image_bytes = io.BytesIO()
+    image = Image.new("RGB", (900, 600), "white")
+    for x in range(100, 800, 20):
+        for y in range(100, 500, 20):
+            if (x // 20 + y // 20) % 2:
+                for xx in range(x, min(x + 20, 800)):
+                    for yy in range(y, min(y + 20, 500)):
+                        image.putpixel((xx, yy), (20, 20, 20))
+    image.save(image_bytes, format="PNG")
+    response = client.post(
+        "/api/v1/certificate/verify",
+        data={"certificate_type": "Bonafide certificate", "document_type": "ID"},
+        files={"document": ("student-id.png", image_bytes.getvalue(), "image/png")},
+        headers=student_headers,
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    request_id = payload["decision"]["request_id"]
+    document = payload["decision"]["entities"]["supporting_documents"][0]
+    path = f"/api/v1/requests/{request_id}/attachments/{document['id']}"
+    assert client.get(path, headers=student_headers).status_code == 200
+    admin_view = client.get(path, headers=admin_headers)
+    assert admin_view.status_code == 200
+    assert admin_view.headers["content-type"] == "image/png"
+
+    suffix = uuid.uuid4().hex[:8]
+    signup = client.post("/api/v1/auth/signup", json={
+        "name": "Unrelated Student", "roll_no": f"UN-{suffix}",
+        "email": f"unrelated-{suffix}@campus.edu", "mobile": "9876543210",
+        "role": "STUDENT", "password": "secret123",
+    }).json()
+    outsider = _verify_signup(client, signup)
+    assert client.get(path, headers={"Authorization": f"Bearer {outsider['access_token']}"}).status_code == 403
+
+
 def test_notifications_require_authentication(client):
     assert client.get("/api/v1/notifications").status_code == 401
 

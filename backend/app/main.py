@@ -12,9 +12,9 @@ from app.db_models import User
 Base.metadata.create_all(bind=engine)
 
 # SQLite's default UNIQUE comparison is case-sensitive and the original schema
-# predates roll-number uniqueness. These indexes enforce identity uniqueness at
+# predates SOA ID uniqueness. These indexes enforce identity uniqueness at
 # the database layer as well as in the signup validation, including concurrent
-# requests. Empty roll numbers remain allowed for accounts that do not have one.
+# requests. Empty SOA IDs remain allowed for accounts that do not have one.
 with engine.begin() as connection:
     connection.exec_driver_sql(
         "CREATE UNIQUE INDEX IF NOT EXISTS uq_users_email_nocase ON users(email COLLATE NOCASE)"

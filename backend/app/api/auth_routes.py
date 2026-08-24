@@ -11,7 +11,7 @@ from app.schemas.auth import (AccessInput, EmailResendInput, EmailVerificationIn
                               SignupInput, TokenOut, UserDecisionInput, UserOut)
 from app.services import audit_service
 from app.services import email_verification_service
-from app.services import maintenance_attachment_service, notification_service, request_service
+from app.services import maintenance_attachment_service, notification_service, request_service, supporting_attachment_service
 from app.services.booking_service import BOOKINGS
 from app.services.notification_service import notify
 
@@ -33,7 +33,7 @@ def signup(payload: SignupInput, db: Session = Depends(get_db)):
     if db.query(User).filter(func.lower(User.email) == email).first():
         raise HTTPException(409, "An account with this email already exists.")
     if roll_no and db.query(User).filter(func.upper(User.roll_no) == roll_no).first():
-        raise HTTPException(409, "An account with this roll / employee number already exists.")
+        raise HTTPException(409, "An account with this SOA ID already exists.")
     status = "EMAIL_PENDING"
     user = User(
         name=payload.name,
@@ -197,6 +197,7 @@ def delete_user(user_id: int, admin: User = Depends(require_admin), db: Session 
     request_ids = [rid for rid, request in request_service.REQUESTS.items() if request.user_id == email]
     for request_id in request_ids:
         maintenance_attachment_service.delete_for_request(request_id)
+        supporting_attachment_service.delete_for_request(request_id)
         request_service.REQUESTS.pop(request_id, None)
     for key, owner in list(BOOKINGS.items()):
         if owner == email:

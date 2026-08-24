@@ -21,6 +21,7 @@ from app.services import conversation_service
 from app.services import knowledge_gap_service
 from app.services.document_verification_service import verify as verify_document
 from app.services import maintenance_attachment_service
+from app.services import supporting_attachment_service
 from app.services import task_plan_service
 from app.services.booking_service import suggest_slot
 from app.services.prompt_injection_service import contains_override_attempt, inspect_text
@@ -594,7 +595,7 @@ def _privacy_access_attempt(text: str) -> bool:
     protected_data = bool(re.search(
         r"\b(?:request|requests|ticket|tickets|complaint|complaints|grievance|grievances|"
         r"conversation|chat|history|message|messages|personal data|private data|email|"
-        r"phone|mobile|roll number|employee number|document|notification|profile)\b",
+        r"phone|mobile|SOA ID|roll number|employee number|document|notification|profile)\b",
         low,
     ))
     disclosure = bool(re.search(
@@ -811,7 +812,7 @@ def _certificate_message(user: User, certificate_type: str, lang: str) -> dict:
     message = (
         f"I can help you request a {certificate_type}. Before I route anything to the academic office, "
         "I need to verify one clear scan of your student ID or marksheet. I'll check legibility, document format, "
-        "and whether the name and roll number match your enrollment record. Open Verify document to upload it; "
+        "and whether the name and SOA ID match your enrollment record. Open Verify document to upload it; "
         "the request will be created only after that check."
     )
     return {"type": "message", "message": translator.localize(message, lang), "language": lang,
@@ -1156,6 +1157,13 @@ async def verify_certificate_document(
             request.status = RequestStatus.ESCALATED
             request.reason = "Automated document extraction was unavailable. Routed to an administrator for manual document verification."
             audit_service.record(request.id, user.email, "DOCUMENT_VERIFICATION", "MANUAL_REVIEW", request.policy_name, request.risk)
+        normalized_type = (document.content_type or "").lower().split(";", 1)[0].strip()
+        if normalized_type in {"", "application/octet-stream"} and (document.filename or "").lower().endswith(".pdf"):
+            normalized_type = "application/pdf"
+        supporting_attachment_service.save(
+            request, content, normalized_type, document.filename or "supporting-document", "CERTIFICATE",
+        )
+        audit_service.record(request.id, user.email, "ATTACH_SUPPORTING_DOCUMENT", "UPLOADED", request.policy_name, request.risk)
         response = serialize(request, policy, permitted, audit_id).model_dump()
         return {"verification": verification.as_dict(), "routed": True, "decision": response}
     return {"verification": verification.as_dict(), "routed": False, "decision": None}
@@ -1818,6 +1826,24 @@ def get_maintenance_attachment(request_id: str, attachment_id: str,
     if not metadata or not path:
         raise HTTPException(404, "Attachment not found")
     return FileResponse(path, media_type=metadata["content_type"], filename=metadata["filename"])
+
+@router.get("/requests/{request_id}/attachments/{attachment_id}")
+def get_request_attachment(request_id: str, attachment_id: str,
+                           user: User = Depends(get_current_user)):
+    """Preview private evidence as its original image/PDF; owner and admins only."""
+    request = request_service.REQUESTS.get(request_id)
+    if not request:
+        raise HTTPException(404, "Request not found")
+    if user.role not in ("ADMIN", "APPROVER") and request.user_id != user.email:
+        raise HTTPException(403, "RBAC privacy boundary: you cannot view another user's supporting documents.")
+    metadata = next((item for item in request.entities.get("supporting_documents", [])
+                     if item.get("id") == attachment_id), None)
+    path = supporting_attachment_service.locate(request_id, attachment_id)
+    if not metadata or not path:
+        raise HTTPException(404, "Supporting document not found")
+    audit_service.record(request.id, user.email, "VIEW_SUPPORTING_DOCUMENT", "AUTHORIZED", request.policy_name, request.risk)
+    return FileResponse(path, media_type=metadata["content_type"], filename=metadata["filename"],
+                        content_disposition_type="inline")
 
 @router.get("/requests")
 def requests(user: User = Depends(get_current_user)):

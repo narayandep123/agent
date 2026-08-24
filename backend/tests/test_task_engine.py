@@ -40,6 +40,19 @@ def test_plan_schema_rejects_unknown_and_cyclic_dependencies():
         ]})
 
 
+def test_resolved_bonafide_policy_topic_is_not_left_missing():
+    plan = AgentPlan.model_validate({"tasks": [{
+        "task_id": "task_1", "type": "POLICY_QUESTION",
+        "summary": "Explain the bonafide certificate policy",
+        "known_params": {"policy_topic": "bonafide certificate"},
+        "missing_params": ["policy_topic"], "depends_on": [], "parallel_safe": True,
+    }]})
+    from app.agents.gemini_adapter import _coerce
+    task = _coerce(plan, "Explain the bonafide certificate policy")["tasks"][0]
+    assert task["known_params"]["policy_topic"] == "bonafide certificate"
+    assert task["missing_params"] == []
+
+
 def test_independent_task_runs_when_another_task_needs_information(client, student_headers, monkeypatch):
     monkeypatch.setattr("app.api.routes.propose_plan", lambda *_args, **_kwargs: ([
         {
