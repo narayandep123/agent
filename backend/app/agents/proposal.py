@@ -73,22 +73,131 @@ def propose(text: str) -> tuple[str, dict, str, str]:
     return "UNSUPPORTED", {}, language, "guardrail"
 
 
-def propose_plan(text: str) -> tuple[list[dict], str, str]:
-    """Plan multiple tasks without authorising or executing any of them."""
-    llm = gemini_adapter.plan(text)
+def propose_plan(text: str, current_plan: list[dict] | None = None,
+                 frustrated: bool = False) -> tuple[list[dict], str, str]:
+    """Build or update a task DAG by meaning, never by connector tokens."""
+    llm = gemini_adapter.plan(text, current_plan)
     if llm:
         return llm["tasks"], llm["urgency"], "gemini"
 
-    # Conservative offline fallback: only explicit separators create tasks.
+    # A terse follow-up updates the matching unresolved task in place.
+    if current_plan:
+        updated = [{**task, "known_params": dict(task.get("known_params", {}))} for task in current_plan]
+        unresolved = [task for task in updated if task.get("status", "PENDING") not in {
+            "COMPLETED", "FAILED", "ROLLED_BACK",
+        }]
+        supplied = _supplied_for_waiting(text, unresolved)
+        if supplied:
+            task, values = supplied
+            task["known_params"].update(values)
+            task["entities"] = dict(task["known_params"])
+            task["missing_params"] = _missing_params(task["intent"], task["known_params"])
+            task["summary"] = f"{task.get('summary', '')} {text}".strip()[:240]
+            task["status"] = "READY" if not task["missing_params"] else "PENDING"
+            return updated, "NORMAL", "deterministic-update"
+        if frustrated and unresolved:
+            for task in unresolved:
+                task["defaults_applied"] = _safe_defaults(task["intent"], task.get("missing_params", []))
+                task["requires_human_confirmation"] = True
+                task["missing_params"] = []
+                task["status"] = "READY"
+            return updated, "NORMAL", "deterministic-update"
+
+    # Punctuation only creates candidate linguistic spans. A span becomes a task
+    # only after it independently classifies to a supported service meaning.
     import re
-    parts = [part.strip(" ,.") for part in re.split(
-        r"\b(?:and also|also|then)\b|[;\n]+", text, flags=re.I
-    ) if part.strip(" ,.")]
-    if len(parts) < 2:
+    candidates = [part.strip(" ,.") for part in re.split(r"(?<=[.!?])\s+|[\n;]+", text) if part.strip(" ,.")]
+    if len(candidates) == 1:
+        candidates = _category_segments(text)
+    classified = []
+    for candidate in candidates:
+        intent, entities, _, _ = propose(candidate)
+        if intent != "UNSUPPORTED" or len(candidates) == 1:
+            classified.append((candidate, intent, entities))
+    if not classified:
         intent, entities, _, _ = propose(text)
-        return [{"intent": intent, "summary": text.strip()[:240], "entities": entities}], "NORMAL", "deterministic"
-    tasks = []
-    for part in parts[:6]:
-        intent, entities, _, _ = propose(part)
-        tasks.append({"intent": intent, "summary": part[:240], "entities": entities})
+        classified = [(text.strip(), intent, entities)]
+
+    tasks = [dict(task) for task in (current_plan or [])]
+    starting_index = len(tasks) + 1
+    for index, (part, intent, entities) in enumerate(classified[:max(0, 8 - len(tasks))], start=starting_index):
+        tasks.append({
+            "task_id": f"t{index}", "intent": intent, "summary": part[:240],
+            "entities": entities, "known_params": _known_params(entities),
+            "missing_params": _missing_params(intent, entities), "depends_on": [],
+            "parallel_safe": True, "status": "PENDING", "requires_human_confirmation": False,
+        })
     return tasks, "NORMAL", "deterministic"
+
+
+def _category_segments(text: str) -> list[str]:
+    """Extract different service meanings stated back-to-back in one sentence."""
+    import re
+    candidates = [part.strip(" ,.") for part in re.split(
+        r"(?i)(?=\b(?:tell|explain|report|raise|file|book|reserve|request|show|need|want)\b)", text,
+    ) if part.strip(" ,.")]
+    classified: list[tuple[str, str]] = []
+    for part in candidates:
+        intent, _, _, _ = propose(part)
+        if intent != "UNSUPPORTED":
+            classified.append((intent, part))
+        elif classified:
+            intent, prior = classified[-1]
+            classified[-1] = (intent, f"{prior} {part}"[:240])
+    result: list[str] = []
+    previous_intent = None
+    for intent, part in classified:
+        if intent == previous_intent and result:
+            result[-1] = f"{result[-1]} {part}"[:240]
+        else:
+            result.append(part)
+            previous_intent = intent
+    return result or [text.strip()]
+
+
+def _supplied_for_waiting(text: str, unresolved: list[dict]) -> tuple[dict, dict] | None:
+    for task in unresolved:
+        if task.get("intent") == "MAINTENANCE":
+            values = _known_params(maintenance_entities(text))
+        elif task.get("intent") == "LAB_BOOKING":
+            values = _known_params(booking_entities(text))
+            if values.get("seat") == "Auto assign":
+                values.pop("seat", None)
+        else:
+            values = {}
+        relevant = {key: value for key, value in values.items()
+                    if key in task.get("missing_params", []) or key in task.get("known_params", {})}
+        if relevant:
+            return task, relevant
+    return None
+
+
+def _safe_defaults(intent: str, missing: list[str]) -> dict:
+    defaults = {}
+    for field in missing:
+        if intent == "MAINTENANCE" and field in {"location", "floor"}:
+            defaults[field] = "To be confirmed by facilities"
+        elif intent == "MAINTENANCE" and field == "issue":
+            defaults[field] = "General facility issue"
+        elif intent == "LAB_BOOKING" and field == "space":
+            defaults[field] = "Auto-assign available campus resource"
+        elif intent == "LAB_BOOKING" and field in {"date", "time"}:
+            defaults[field] = "Next policy-compliant available slot"
+        else:
+            defaults[field] = "To be confirmed by an authorized human reviewer"
+    return defaults
+
+
+def _known_params(entities: dict) -> dict:
+    return {key: value for key, value in entities.items() if value not in (None, "", "Not specified")}
+
+
+def _missing_params(intent: str, entities: dict) -> list[str]:
+    required = {
+        "MAINTENANCE": ("issue", "location", "floor"),
+        "LAB_BOOKING": ("space", "date", "time"),
+        "CERTIFICATE": ("certificate_type",),
+        "GRIEVANCE": ("summary",),
+        "POLICY_QUESTION": ("policy_topic",),
+    }.get(intent, ())
+    return [key for key in required if entities.get(key) in (None, "", "Not specified")]

@@ -1,5 +1,6 @@
 import json
 import time
+import asyncio
 from fastapi import APIRouter, Depends, HTTPException, File, Form, UploadFile
 from fastapi.responses import StreamingResponse
 from fastapi.responses import FileResponse
@@ -11,7 +12,7 @@ from app.agents.router import route_turn
 from app.agents import translator
 from app.auth.deps import get_current_user, require_admin
 from app.db_models import User
-from app.db import get_db
+from app.db import SessionLocal, get_db
 from app.models.domain import Decision, RequestStatus
 from app.rag.retriever import search, get_policy, is_grounded, list_policies
 from app.services import audit_service, request_service
@@ -20,6 +21,7 @@ from app.services import conversation_service
 from app.services import knowledge_gap_service
 from app.services.document_verification_service import verify as verify_document
 from app.services import maintenance_attachment_service
+from app.services import task_plan_service
 from app.services.booking_service import suggest_slot
 from app.services.prompt_injection_service import contains_override_attempt, inspect_text
 from app.services.tone_service import analyze as analyze_tone
@@ -40,6 +42,11 @@ LAST_POLICY: dict[str, str] = {}
 # lets a user change topics without losing already collected slots.
 SUSPENDED_TASKS: dict[str, dict[str, dict]] = {}
 CONTEXT_NOTES: dict[str, str] = {}
+# Full dependency-aware task plans, keyed by authenticated user+conversation.
+# This demo store mirrors the existing workflow memory; production should move
+# it to durable database tables before running multiple workers.
+TASK_PLANS: dict[str, list[dict]] = {}
+TASK_TURN_IDS: dict[str, list[str]] = {}
 
 AFFIRM_WORDS = {"yes", "y", "yeah", "yep", "yup", "confirm", "confirmed", "ok", "okay", "sure", "proceed", "book it", "go ahead", "haan", "done", "theek hai", "thik hai", "perfect", "great", "yes please", "please do", "haan ji"}
 CANCEL_WORDS = {"no", "nope", "cancel", "stop", "abort", "nah", "nahi", "never mind", "nevermind", "forget it", "leave it", "not now", "no thanks", "rehne do"}
@@ -822,6 +829,8 @@ def _execute_compound_task(task: dict, user_key: str, user: User, lang: str, db:
         gap = knowledge_gap_service.raise_gap(db, text, user.email)
         return [_message(_knowledge_gap_text(gap.id), lang,
                          knowledge_gap={"id": gap.id, "status": gap.status})]
+    if intent == "IDENTITY_QUESTION":
+        return [_own_identity_message(user, lang)]
     if intent == "MAINTENANCE":
         result = _handle_maintenance(user_key, text, user.role, lang, user.email, db)
     elif intent == "GRIEVANCE":
@@ -867,6 +876,193 @@ def _execute_compound_task(task: dict, user_key: str, user: User, lang: str, db:
         outputs.append({"type": "message", **result["follow_up"], "language": lang})
         result.pop("follow_up", None)
     return outputs
+
+
+def _task_outcome(outputs: list[dict], task: dict | None = None) -> str:
+    """Map governed handler output to an executor state used by dependencies."""
+    if not outputs:
+        return "FAILED"
+    result = outputs[-1]
+    if result.get("type") == "decision":
+        status = result.get("decision", {}).get("status", "")
+        if status == "STOPPED":
+            return "FAILED"
+        if status in {"AWAITING_CONFIRMATION", "PENDING_APPROVAL", "ESCALATED"}:
+            return "AWAITING_CONFIRMATION"
+        return "COMPLETED"
+    if result.get("clarification") or result.get("action"):
+        return "AWAITING_CONFIRMATION"
+    if task and task.get("missing_params") and result.get("type") == "message":
+        return "PENDING"
+    if result.get("knowledge_gap"):
+        return "COMPLETED"
+    return "COMPLETED"
+
+
+def _side_effect(outputs: list[dict]) -> tuple[str, str]:
+    for item in outputs:
+        decision = item.get("decision", {})
+        if decision.get("request_id"):
+            return decision.get("intent", "REQUEST"), decision["request_id"]
+    return "", ""
+
+
+def _run_task_once(plan_id: str, task: dict, user_key: str, user: User, lang: str) -> tuple[list[dict], str, bool]:
+    """Run one task with an isolated DB session and persisted idempotency result."""
+    session = SessionLocal()
+    try:
+        cached = task_plan_service.cached(session, plan_id, task["task_id"])
+        if cached:
+            result, status = cached
+            for item in result:
+                item["cache_hit"] = True
+            return result, status, True
+        existing = task_plan_service.execution(session, plan_id, task["task_id"])
+        if existing and existing.status == "RUNNING":
+            # A reconnect must not execute the same side effect a second time.
+            result = [_message(
+                f"Task {task['task_id']} is already running; its persisted result will be reused when ready.", lang,
+                task_id=task["task_id"], task_status="RUNNING", cache_hit=True,
+            )]
+            return result, "RUNNING", True
+        task["status"] = "RUNNING"
+        task_plan_service.record_result(session, plan_id, task["task_id"], "RUNNING", [])
+        result = _execute_compound_task(task, user_key, user, lang, session)
+        status = _task_outcome(result, task)
+        effect_type, effect_ref = _side_effect(result)
+        for item in result:
+            item.update({
+                "task_id": task["task_id"], "task_status": status,
+                "depends_on": task.get("depends_on", []),
+                "missing_params": task.get("missing_params", []),
+            })
+        task_plan_service.record_result(
+            session, plan_id, task["task_id"], status, result, effect_type, effect_ref,
+        )
+        return result, status, False
+    except Exception as error:
+        result = [_message(
+            f"Task {task['task_id']} failed safely: {str(error)[:160]}", lang,
+            task_id=task["task_id"], task_status="FAILED",
+        )]
+        task_plan_service.record_result(session, plan_id, task["task_id"], "FAILED", result)
+        return result, "FAILED", False
+    finally:
+        session.close()
+
+
+async def _execute_task_plan_async(tasks: list[dict], plan_id: str, user_key: str, user: User, lang: str,
+                                   execute_ids: set[str] | None = None) -> tuple[list[dict], list[list[str]]]:
+    terminal = {"COMPLETED", "FAILED", "ROLLED_BACK"}
+    outcomes = {
+        task["task_id"]: task.get("status", "PENDING") for task in tasks
+        if task.get("status") in terminal or (execute_ids is not None and task["task_id"] not in execute_ids)
+    }
+    remaining = {task["task_id"]: task for task in tasks if task["task_id"] not in outcomes}
+    outputs: list[dict] = []
+    groups: list[list[str]] = []
+    while remaining:
+        progress = False
+        for task_id, task in list(remaining.items()):
+            dependency_states = [outcomes.get(dep) for dep in task.get("depends_on", [])]
+            if any(state in {"FAILED", "ROLLED_BACK"} for state in dependency_states):
+                task["status"] = outcomes[task_id] = "FAILED"
+                outputs.append(_message(
+                    f"Task {task_id} cannot run because a required task failed.", lang,
+                    task_id=task_id, task_status="FAILED", depends_on=task.get("depends_on", []),
+                ))
+                remaining.pop(task_id)
+                progress = True
+        ready = [task for task in remaining.values()
+                 if not task.get("missing_params")
+                 and all(outcomes.get(dep) == "COMPLETED" for dep in task.get("depends_on", []))]
+        waiting = [task for task in remaining.values() if task.get("missing_params")]
+        for task in waiting:
+            task_id = task["task_id"]
+            if task.get("requires_human_confirmation") and task.get("defaults_applied"):
+                task["status"] = outcomes[task_id] = "AWAITING_CONFIRMATION"
+                outputs.append(_message(
+                    f"Task {task_id} uses safe defaults and requires human confirmation before execution.", lang,
+                    task_id=task_id, task_status="AWAITING_CONFIRMATION",
+                    defaults_applied=task.get("defaults_applied", {}), human_confirmation_required=True,
+                ))
+            else:
+                task["status"] = outcomes[task_id] = "PENDING"
+                outputs.append(_message(
+                    f"Task {task_id} still needs: {', '.join(task['missing_params'])}.", lang,
+                    task_id=task_id, task_status="PENDING", missing_params=task["missing_params"],
+                ))
+            task["result"] = outputs[-1:]
+            remaining.pop(task_id)
+            progress = True
+        if ready:
+            parallel = [task for task in ready if task.get("parallel_safe")]
+            batch = parallel or [ready[0]]  # unsafe tasks are strictly one-at-a-time
+            for task in batch:
+                task["status"] = "READY"
+            groups.append([task["task_id"] for task in batch])
+            results = await asyncio.gather(*[
+                asyncio.to_thread(_run_task_once, plan_id, task, user_key, user, lang) for task in batch
+            ])
+            for task, (task_outputs, status, _cached) in zip(batch, results):
+                task["status"] = outcomes[task["task_id"]] = status
+                task["result"] = task_outputs
+                outputs.extend(task_outputs)
+                remaining.pop(task["task_id"], None)
+                if status == "FAILED" and any(task["task_id"] in item.get("depends_on", []) for item in tasks):
+                    effect_type, effect_ref = _side_effect(task_outputs)
+                    if effect_ref:
+                        rolled_back = request_service.compensate(effect_ref)
+                        if rolled_back:
+                            task["status"] = outcomes[task["task_id"]] = "ROLLED_BACK"
+                            with SessionLocal() as compensation_db:
+                                task_plan_service.mark_compensated(compensation_db, plan_id, task["task_id"], True)
+            progress = True
+        if not progress:
+            for task in remaining.values():
+                dependencies = task.get("depends_on", [])
+                known_dependencies = all(any(item["task_id"] == dep for item in tasks) for dep in dependencies)
+                status = "PENDING" if known_dependencies else "FAILED"
+                task["status"] = outcomes[task["task_id"]] = status
+                message = (
+                    f"Task {task['task_id']} is waiting for prerequisite tasks to complete."
+                    if status == "PENDING" else
+                    f"Task {task['task_id']} has an invalid dependency graph."
+                )
+                item = _message(message, lang, task_id=task["task_id"], task_status=status,
+                                depends_on=dependencies)
+                outputs.append(item)
+                task["result"] = [item]
+            break
+    return outputs, groups
+
+
+def _execute_task_plan(tasks: list[dict], plan_id: str, user_key: str, user: User, lang: str,
+                       execute_ids: set[str] | None = None) -> tuple[list[dict], list[list[str]]]:
+    return asyncio.run(_execute_task_plan_async(tasks, plan_id, user_key, user, lang, execute_ids))
+
+
+def _normalize_parallel_safety(tasks: list[dict]) -> list[dict]:
+    """Only competing tasks are unsafe; mention order is irrelevant."""
+    normalized = [dict(task) for task in tasks]
+    for task in normalized:
+        task["parallel_safe"] = True
+    for index, first in enumerate(normalized):
+        for second in normalized[index + 1:]:
+            first_params = first.get("known_params", {})
+            second_params = second.get("known_params", {})
+            same_booking_resource = (
+                first.get("intent") == second.get("intent") == "LAB_BOOKING"
+                and first_params.get("space") and first_params.get("space") == second_params.get("space")
+                and first_params.get("date") and first_params.get("date") == second_params.get("date")
+            )
+            same_record = (
+                first_params.get("request_id") and
+                first_params.get("request_id") == second_params.get("request_id")
+            )
+            if same_booking_resource or same_record:
+                first["parallel_safe"] = second["parallel_safe"] = False
+    return normalized
 
 def serialize(request, policy=None, permitted=True, audit_id=""):
     needs_details = any(text in request.reason.lower() for text in ("missing information", "no preference")) or (request.intent == "MAINTENANCE" and ("please tell me" in request.reason.lower() or "need the floor" in request.reason.lower()))
@@ -1021,7 +1217,8 @@ def _assistant_impl(payload: RequestInput, user: User, db: Session):
     if _privacy_access_attempt(text_en):
         audit_service.record("PRIVACY-BOUNDARY", user.email, "CROSS-USER_ACCESS", "DENIED", "RBAC privacy boundary", "HIGH")
         return _privacy_boundary_message(lang)
-    if _asks_own_identity(text_en):
+    multi_signal = bool(re.search(r"\b(?:and also|also|then)\b|[;\n]+", text_en, re.I))
+    if _asks_own_identity(text_en) and not multi_signal:
         return _own_identity_message(user, lang)
     role_conflict = _contradictory_role_message(text_en, user, lang)
     if role_conflict:
@@ -1032,6 +1229,29 @@ def _assistant_impl(payload: RequestInput, user: User, db: Session):
         audit_service.record("SELF-DECISION", user.email, "ROLE_SEPARATION", "DENIED", "Authenticated role boundary", "HIGH")
         return self_decision
     turn = route_turn(text_en)
+    # Decomposition is performed once per turn. Single-task turns continue down
+    # the established conversational path; multi-task turns use the DAG executor.
+    plan_record = task_plan_service.load_active(db, user_key)
+    current_plan = task_plan_service.tasks(plan_record)
+    tasks, urgency, planner = propose_plan(text_en, current_plan, tone.frustrated)
+    tasks = _normalize_parallel_safety(tasks)
+    prior = {task["task_id"]: task for task in (current_plan or [])}
+    changed_ids = [
+        task["task_id"] for task in tasks
+        if task["task_id"] not in prior or any(
+            task.get(field) != prior[task["task_id"]].get(field)
+            for field in ("known_params", "missing_params", "summary", "status", "defaults_applied")
+        )
+    ]
+    if not current_plan:
+        changed_ids = [task["task_id"] for task in tasks]
+    TASK_TURN_IDS[user_key] = changed_ids
+    TASK_PLANS[user_key] = tasks
+    plan_record = task_plan_service.save(
+        db, user_key, tasks, plan_record.id if plan_record else None,
+    )
+    if len(tasks) == 1 and tasks[0].get("intent") == "IDENTITY_QUESTION":
+        return _own_identity_message(user, lang)
     extracted_action = _buried_action(text_en, turn.intent)
     if extracted_action:
         _queue_context_note(
@@ -1042,17 +1262,19 @@ def _assistant_impl(payload: RequestInput, user: User, db: Session):
     # Compound requests are decomposed, then each task is actually run through
     # its normal policy, permission, risk and confirmation gates. A plan alone is
     # not a completed agent turn.
-    if re.search(r"\b(?:and also|also|then)\b|[;\n]+", text_en, re.I):
-        tasks, urgency, planner = propose_plan(text_en)
-        actionable = [task for task in tasks if task["intent"] != "UNSUPPORTED"]
-        if len(tasks) > 1 and actionable:
-            CONVERSATION.pop(user_key, None)
-            outputs = []
-            for task in tasks:
-                outputs.extend(_execute_compound_task(task, user_key, user, lang, db))
-            return {"type": "compound", "message": translator.localize(
-                "I completed each supported task in order. Any task that still needs information or confirmation is shown below.", lang),
-                "language": lang, "planner": planner, "urgency": urgency, "outputs": outputs}
+    actionable = [task for task in tasks if task["intent"] != "UNSUPPORTED"]
+    changed_actionable = [task for task in tasks if task["task_id"] in changed_ids and task["intent"] != "UNSUPPORTED"]
+    if len(changed_ids) > 1 and changed_actionable:
+        CONVERSATION.pop(user_key, None)
+        outputs, execution_groups = _execute_task_plan(
+            tasks, plan_record.id, user_key, user, lang, set(changed_ids),
+        )
+        TASK_PLANS[user_key] = tasks
+        task_plan_service.save(db, user_key, tasks, plan_record.id)
+        return {"type": "compound", "message": translator.localize(
+            "I executed every ready task through its policy, permission, risk, and approval checks. Tasks still waiting on details or prerequisites are identified below.", lang),
+            "language": lang, "planner": planner, "urgency": urgency, "plan_id": plan_record.id,
+            "plan": tasks, "execution_groups": execution_groups, "outputs": outputs}
     resumed_now = False
     if not CONVERSATION.get(user_key):
         resumed_now = bool(_resume_workflow(user_key, text_en, turn.intent))
@@ -1446,6 +1668,38 @@ def _acknowledge_frustration(result: dict, lang: str) -> dict:
     return result
 
 
+def _sync_and_attach_plan(user_key: str, result: dict, db: Session) -> dict:
+    """Reflect a normal single-task result in the persistent full plan."""
+    record = task_plan_service.load_active(db, user_key)
+    plan = task_plan_service.tasks(record) if record else TASK_PLANS.get(user_key)
+    if not plan:
+        return result
+    if result.get("type") != "compound":
+        turn_ids = set(TASK_TURN_IDS.get(user_key, []))
+        active = next((task for task in plan if task.get("task_id") in turn_ids and task.get("status", "PENDING") not in {
+            "COMPLETED", "FAILED", "ROLLED_BACK",
+        }), None)
+        if active:
+            if result.get("type") == "decision":
+                status = result.get("decision", {}).get("status", "")
+                active["status"] = (
+                    "FAILED" if status == "STOPPED" else
+                    "AWAITING_CONFIRMATION" if status in {"AWAITING_CONFIRMATION", "PENDING_APPROVAL", "ESCALATED"}
+                    else "COMPLETED"
+                )
+            elif result.get("knowledge_gap"):
+                active["status"] = "COMPLETED"
+            elif result.get("clarification") or result.get("action"):
+                active["status"] = "AWAITING_CONFIRMATION" if result.get("action") else "PENDING"
+            elif result.get("sources"):
+                active["status"] = "COMPLETED"
+    if record:
+        record = task_plan_service.save(db, user_key, plan, record.id)
+        result["plan_id"] = record.id
+    result["plan"] = plan
+    return result
+
+
 @router.post("/assistant")
 def assistant(payload: RequestInput, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     """Inspect untrusted input, then run any legitimate request through normal governance."""
@@ -1456,6 +1710,7 @@ def assistant(payload: RequestInput, user: User = Depends(get_current_user), db:
     if not inspection.detected:
         result = _assistant_impl(payload, user, db)
         result = _apply_context_note(result, user_key, lang)
+        result = _sync_and_attach_plan(user_key, result, db)
         return _acknowledge_frustration(result, lang) if tone.frustrated else result
     audit_service.record("INPUT-GUARD", user.email, "PROMPT_INJECTION", "IGNORED", "System instruction boundary", "HIGH")
     if not inspection.cleaned_text:
@@ -1466,6 +1721,7 @@ def assistant(payload: RequestInput, user: User = Depends(get_current_user), db:
     safe_payload = payload.model_copy(update={"text": inspection.cleaned_text})
     result = _note_ignored_override(_assistant_impl(safe_payload, user, db))
     result = _apply_context_note(result, user_key, lang)
+    result = _sync_and_attach_plan(user_key, result, db)
     return _acknowledge_frustration(result, lang) if tone.frustrated else result
 
 
