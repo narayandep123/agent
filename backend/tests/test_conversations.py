@@ -1,13 +1,19 @@
 import uuid
+import re
 
 
 def _student(client):
     suffix = uuid.uuid4().hex[:8]
-    response = client.post("/api/v1/auth/signup", json={
+    email = f"memory-{suffix}@campus.edu"
+    client.post("/api/v1/auth/signup", json={
         "name": "Memory Student", "roll_no": f"MEM-{suffix}",
-        "email": f"memory-{suffix}@campus.edu",
+        "email": email,
         "mobile": "9876543210", "role": "STUDENT", "password": "secret123",
     })
+    from app.services.notification_service import OUTBOX
+    body = next(item["body"] for item in OUTBOX if item["to"] == email and "verification code" in item["body"])
+    code = re.search(r"\b\d{6}\b", body).group(0)
+    response = client.post("/api/v1/auth/verify-email", json={"email": email, "code": code})
     return {"Authorization": f"Bearer {response.json()['access_token']}"}
 
 
@@ -28,7 +34,9 @@ def test_conversation_messages_persist_and_title_is_generated(client, student_he
 def test_conversations_are_private_to_their_owner(client, student_headers):
     cid = client.post("/api/v1/conversations", json={}, headers=student_headers).json()["id"]
     other = _student(client)
-    assert client.get(f"/api/v1/conversations/{cid}/messages", headers=other).status_code == 404
+    denied = client.get(f"/api/v1/conversations/{cid}/messages", headers=other)
+    assert denied.status_code == 404
+    assert "privacy boundary" in denied.json()["detail"]
     assert client.post(f"/api/v1/conversations/{cid}/messages", json={
         "role": "user", "text": "Trying to read another user's chat",
     }, headers=other).status_code == 404

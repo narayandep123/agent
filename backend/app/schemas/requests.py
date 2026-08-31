@@ -3,7 +3,9 @@ from pydantic import BaseModel, Field
 from app.models.domain import Role
 
 class RequestInput(BaseModel):
-    text: str = Field(min_length=3, max_length=1000)
+    # Empty/noise-only input is handled conversationally by the assistant rather
+    # than rejected as a schema error.
+    text: str = Field(default="", max_length=1000)
     role: Role = Role.STUDENT
     language: str = "auto"
     conversation_id: str | None = None

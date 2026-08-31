@@ -62,12 +62,14 @@ def create(text: str, role, proposed_intent: str | None = None, proposed_entitie
     space_unspecified = intent == "LAB_BOOKING" and not missing_core_booking and entities.get("space") == "Not specified"
     booking_date = entities.get("date", "")
     sunday_booking = intent == "LAB_BOOKING" and (booking_date == "Sunday" or (booking_date not in ("", "Not specified") and current_date.fromisoformat(booking_date).weekday() == 6))
-    missing_location = intent == "MAINTENANCE" and entities.get("location") == "Not specified"
+    proceed_with_gaps = intent == "MAINTENANCE" and bool(entities.get("proceed_with_gaps"))
+    missing_location = intent == "MAINTENANCE" and entities.get("location") == "Not specified" and not proceed_with_gaps
     missing_floor = (
         intent == "MAINTENANCE"
         and entities.get("issue") == "Water cooler"
         and entities.get("location") != "Not specified"
         and entities.get("floor") == "Not specified"
+        and not proceed_with_gaps
     )
     decision, reason = decide(intent, policy.found, policy.conflict, permitted, risk, policy.uncertain)
     past_time = False
@@ -236,3 +238,23 @@ def update_maintenance(request_id: str, status: str, assigned_to: str, comment: 
     return request, audit_id
 
 def list_requests(): return list(REQUESTS.values())
+
+
+def compensate(request_id: str) -> bool:
+    """Undo only the reversible side effect owned by one failed plan task."""
+    request = REQUESTS.get(request_id)
+    if not request:
+        return False
+    if request.intent == "LAB_BOOKING":
+        from app.services.booking_service import BOOKINGS
+        for key, owner in list(BOOKINGS.items()):
+            if owner == request.user_id and key == (
+                request.entities.get("date"), request.entities.get("time"),
+                request.entities.get("space"), request.entities.get("seat"),
+            ):
+                BOOKINGS.pop(key, None)
+    request.status = RequestStatus.STOPPED
+    request.decision = Decision.STOP
+    request.reason = "This task's own side effect was rolled back after dependent execution failed."
+    record(request.id, request.user_id, "COMPENSATE", "ROLLED_BACK", request.policy_name, request.risk)
+    return True

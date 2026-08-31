@@ -1,7 +1,7 @@
 """Persistent database models."""
 from datetime import datetime, timezone
 
-from sqlalchemy import Column, DateTime, ForeignKey, Integer, String, Text
+from sqlalchemy import Column, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
 
 from app.db import Base
 
@@ -25,6 +25,18 @@ class User(Base):
     status = Column(String, default="ACTIVE")  # ACTIVE | PENDING | REJECTED
     comment = Column(String, default="")  # admin note on an approval/rejection
     password_hash = Column(String, nullable=False)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+
+class EmailVerification(Base):
+    """Short-lived, hashed signup verification challenge."""
+
+    __tablename__ = "email_verifications"
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, unique=True, index=True)
+    code_hash = Column(String, nullable=False)
+    expires_at = Column(DateTime, nullable=False)
+    attempts = Column(Integer, default=0)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 
@@ -62,5 +74,34 @@ class KnowledgeGap(Base):
     status = Column(String, default="OPEN", index=True)  # OPEN | RESOLVED
     occurrences = Column(Integer, default=1)
     policy_id = Column(String, default="")
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), index=True)
+
+
+class TaskPlanRecord(Base):
+    """Durable full task plan for reconnect/reload-safe orchestration."""
+
+    __tablename__ = "task_plans"
+    id = Column(String, primary_key=True)
+    owner_key = Column(String, nullable=False, index=True)
+    status = Column(String, default="ACTIVE", index=True)  # ACTIVE | COMPLETED | FAILED
+    plan_json = Column(Text, nullable=False, default="[]")
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), index=True)
+
+
+class TaskExecutionRecord(Base):
+    """Idempotent result and compensation metadata for one plan task."""
+
+    __tablename__ = "task_executions"
+    __table_args__ = (UniqueConstraint("plan_id", "task_id", name="uq_plan_task_execution"),)
+    id = Column(Integer, primary_key=True)
+    plan_id = Column(String, ForeignKey("task_plans.id"), nullable=False, index=True)
+    task_id = Column(String, nullable=False)
+    status = Column(String, nullable=False)
+    result_json = Column(Text, nullable=False, default="[]")
+    side_effect_type = Column(String, default="")
+    side_effect_ref = Column(String, default="")
+    compensation_status = Column(String, default="")
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), index=True)

@@ -6,6 +6,7 @@ a TestClient and ready-made auth headers so tests can exercise the protected API
 import os
 import tempfile
 import uuid
+import re
 
 # Must run before any `from app...` import so the DB engine binds to the temp file.
 _TEST_DB = os.path.join(tempfile.gettempdir(), "campusflow_test.db")
@@ -30,7 +31,11 @@ def _signup(client, role):
         "name": f"Test {role.title()}", "roll_no": f"CS-{suffix}", "email": email,
         "mobile": "9876543210", "role": role, "password": "secret123",
     })
-    return email, resp
+    from app.services.notification_service import OUTBOX
+    body = next(item["body"] for item in OUTBOX if item["to"] == email and "verification code" in item["body"])
+    code = re.search(r"\b\d{6}\b", body).group(0)
+    verified = client.post("/api/v1/auth/verify-email", json={"email": email, "code": code})
+    return email, verified
 
 
 @pytest.fixture

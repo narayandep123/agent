@@ -16,10 +16,10 @@ Transcript requests require identity verification and academic-office approval. 
 Standard transcripts are issued within five working days. Requests pending fee clearance are held until dues are settled.
 
 ## Required Information
-The request must identify the student's name, roll number, programme, academic period, destination or purpose, and whether an ordinary, signed, sealed, or directly delivered copy is required.
+The request must identify the student's name, SOA ID, programme, academic period, destination or purpose, and whether an ordinary, signed, sealed, or directly delivered copy is required.
 
 ## Document Verification
-A supporting ID or marksheet must be legible and match the enrollment record. Name or roll-number mismatches are returned for correction; uncertain extraction is routed for manual review. The verification assistant cannot change marks, waive a hold, or certify a document.
+A supporting ID or marksheet must be legible and match the enrollment record. Name or SOA ID mismatches are returned for correction; uncertain extraction is routed for manual review. The verification assistant cannot change marks, waive a hold, or certify a document.
 
 ## Corrections
 If a grade, name, programme, or academic period appears incorrect, issuance is paused and a correction case is opened. A corrected transcript is issued only after an authorized officer updates the source academic record.
